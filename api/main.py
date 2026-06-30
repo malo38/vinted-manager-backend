@@ -117,8 +117,8 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
             }, on_conflict="vinted_item_id").execute()
             articles_upserted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SYNC ERROR] annonce {vinted_id}: {e}")
 
     # ── Ventes → articles "vendu" ────────────────────────────────────────────
     for v in payload.ventes:
@@ -139,8 +139,8 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
             }, on_conflict="vinted_item_id").execute()
             articles_upserted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SYNC ERROR] vente {vinted_id}: {e}")
 
     # ── Messages → table conversations ───────────────────────────────────────
     messages_upserted = 0
@@ -208,3 +208,26 @@ def extension_disconnect(user_id: str = Depends(get_current_user_id)):
     sb = get_supabase()
     sb.table("vinted_accounts").update({"connected": False}).eq("user_id", user_id).execute()
     return {"ok": True}
+
+
+# ============================================================
+# ROUTE DEBUG: Stocke les notifications brutes envoyées par l'extension
+# (temporaire, pour explorer le format des favoris Vinted)
+# ============================================================
+
+_LAST_NOTIFICATIONS_DEBUG: dict = {}
+
+@app.post("/api/extension/debug-notifications")
+def debug_notifications(payload: dict, user_id: str = Depends(get_current_user_id)):
+    """Reçoit et stocke temporairement les notifications brutes pour inspection."""
+    global _LAST_NOTIFICATIONS_DEBUG
+    _LAST_NOTIFICATIONS_DEBUG[user_id] = payload
+    print(f"[DEBUG NOTIFICATIONS] user={user_id} payload={payload}")
+    return {"ok": True}
+
+
+@app.get("/api/extension/debug-notifications")
+def get_debug_notifications(user_id: str = Depends(get_current_user_id)):
+    """Retourne les dernières notifications brutes reçues pour inspection."""
+    return _LAST_NOTIFICATIONS_DEBUG.get(user_id, {"message": "Aucune donnée reçue pour le moment."})
+
