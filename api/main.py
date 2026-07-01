@@ -243,14 +243,29 @@ VINTED_BASE = "https://www.vinted.fr/api/v2"
 def vinted_get(cookie: str, path: str, params: dict = None):
     """Appelle l'API Vinted avec un cookie de session."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.vinted.fr/",
+        "Origin": "https://www.vinted.fr",
+        "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         "Cookie": f"_vinted_fr_session={cookie}",
     }
-    r = req_lib.get(f"{VINTED_BASE}{path}", headers=headers, params=params, timeout=10)
+    r = req_lib.get(
+        f"{VINTED_BASE}{path}",
+        headers=headers,
+        params=params,
+        timeout=15,
+    )
+    print(f"[VINTED] GET {path} → {r.status_code}")
     if r.status_code == 401:
         raise HTTPException(status_code=401, detail="Cookie Vinted expiré. Copiez un nouveau cookie depuis vinted.fr.")
+    if r.status_code == 403:
+        raise HTTPException(status_code=403, detail="Accès refusé par Vinted. Essayez de recopier votre cookie.")
     if not r.ok:
         raise HTTPException(status_code=502, detail=f"Erreur Vinted API: {r.status_code}")
     return r.json()
@@ -276,8 +291,8 @@ def sync_via_cookie(payload: CookieSyncPayload, user_id: str = Depends(get_curre
     # ── 1. Récupérer l'utilisateur Vinted ────────────────────────────────────
     try:
         user_raw = vinted_get(cookie, "/users/current")
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Test connexion Vinted: {e.detail}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Impossible de contacter Vinted: {e}")
 
