@@ -9,7 +9,7 @@ Aucune donnée sensible (mot de passe) n'est jamais stockée.
 """
 
 import os
-from datetime import date
+from datetime import date, datetime
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -275,6 +275,110 @@ class CookieSyncPayload(BaseModel):
     cookie: str
 
 
+@app.get("/api/extension/automessage-config")
+def automessage_config(user_id: str = Depends(get_current_user_id)):
+    """
+    Réglages de l'envoi automatique de messages aux favoris, lus par l'extension
+    avant chaque cycle, ainsi que le nombre déjà envoyé aujourd'hui (pour le plafond).
+    """
+    sb = get_supabase()
+    today = date.today().isoformat()
+
+    res = sb.table("vinted_automessage_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    settings = res.data[0] if res.data else {
+        "enabled": False,
+        "template": "",
+        "delay_min_sec": 60,
+        "delay_max_sec": 180,
+        "daily_limit": 20,
+    }
+
+    sent_res = (
+        sb.table("vinted_sent_messages")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .gte("sent_at", f"{today}T00:00:00")
+        .execute()
+    )
+    sent_today = sent_res.count or 0
+
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "template": settings.get("template") or "",
+        "delay_min_sec": int(settings.get("delay_min_sec") or 60),
+        "delay_max_sec": int(settings.get("delay_max_sec") or 180),
+        "daily_limit": int(settings.get("daily_limit") or 20),
+        "sent_today": sent_today,
+    }
+
+
+class AutomessageSettingsPayload(BaseModel):
+    enabled: bool = False
+    template: str = ""
+    delay_min_sec: int = 60
+    delay_max_sec: int = 180
+    daily_limit: int = 20
+
+
+@app.post("/api/settings/automessage")
+def save_automessage_settings(payload: AutomessageSettingsPayload, user_id: str = Depends(get_current_user_id)):
+    """Enregistre les réglages de l'envoi automatique depuis le site."""
+    sb = get_supabase()
+    sb.table("vinted_automessage_settings").upsert({
+        "user_id": user_id,
+        "enabled": payload.enabled,
+        "template": payload.template[:1000],
+        "delay_min_sec": max(10, payload.delay_min_sec),
+        "delay_max_sec": max(payload.delay_min_sec, payload.delay_max_sec),
+        "daily_limit": max(0, payload.daily_limit),
+        "updated_at": datetime.utcnow().isoformat(),
+    }, on_conflict="user_id").execute()
+    return {"ok": True}
+
+
+class MarkMessagedPayload(BaseModel):
+    id: str
+    recipient_login: str = ""
+    recipient_id: str = ""
+    item_id: str = ""
+    item_title: str = ""
+    message: str = ""
+
+
+@app.post("/api/extension/mark-messaged")
+def mark_messaged(payload: MarkMessagedPayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Enregistre un message auto-envoyé par l'extension. Upsert par id de notification
+    Vinted pour être idempotent (jamais deux fois le même favori, même après réinstallation).
+    """
+    sb = get_supabase()
+    sb.table("vinted_sent_messages").upsert({
+        "id": payload.id,
+        "user_id": user_id,
+        "recipient_login": payload.recipient_login[:100],
+        "recipient_id": payload.recipient_id,
+        "item_id": payload.item_id,
+        "item_title": payload.item_title[:255],
+        "message": payload.message[:1000],
+    }, on_conflict="id").execute()
+    return {"ok": True}
+
+
+@app.get("/api/extension/sent-messages")
+def get_sent_messages(user_id: str = Depends(get_current_user_id)):
+    """Historique des messages auto-envoyés, pour affichage sur le site."""
+    sb = get_supabase()
+    res = (
+        sb.table("vinted_sent_messages")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("sent_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return {"messages": res.data or []}
+
+
 @app.post("/api/vinted/sync-cookie")
 def sync_via_cookie(payload: CookieSyncPayload, user_id: str = Depends(get_current_user_id)):
     """
@@ -386,4 +490,3 @@ def sync_via_cookie(payload: CookieSyncPayload, user_id: str = Depends(get_curre
         "articles_upserted": articles_upserted,
         "message": f"Synchronisation réussie — {articles_upserted} articles importés depuis @{vinted_login}",
     }
-
