@@ -83,6 +83,7 @@ class SyncPayload(BaseModel):
     vinted_user_id: str = ""
     vinted_login: str = ""
     ventes: list = []      # articles vendus
+    achats: list = []      # articles achetés (côté acheteur)
     annonces: list = []    # articles en vente (avec favoris/vues)
     messages: list = []    # conversations
 
@@ -143,6 +144,26 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
         except Exception as e:
             print(f"[SYNC ERROR] vente {vinted_id}: {e}")
 
+    # ── Achats → table vinted_purchases (dépenses) ────────────────────────────
+    purchases_upserted = 0
+    for p in payload.achats:
+        vinted_id = str(p.get("id") or "")
+        if not vinted_id:
+            continue
+        try:
+            sb.table("vinted_purchases").upsert({
+                "id": vinted_id,
+                "user_id": user_id,
+                "title": str(p.get("titre") or "")[:255],
+                "price": float(p.get("prix") or 0),
+                "purchase_date": str(p.get("date_achat") or "")[:10] or None,
+                "photo_url": str(p.get("photo") or "") or None,
+                "synced_at": today,
+            }, on_conflict="id").execute()
+            purchases_upserted += 1
+        except Exception as e:
+            print(f"[SYNC ERROR] achat {vinted_id}: {e}")
+
     # ── Messages → table conversations ───────────────────────────────────────
     messages_upserted = 0
     for m in payload.messages:
@@ -178,6 +199,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     return {
         "ok": True,
         "articles_upserted": articles_upserted,
+        "purchases_upserted": purchases_upserted,
         "messages_upserted": messages_upserted,
     }
 
