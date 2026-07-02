@@ -113,6 +113,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "status": "stock",
                 "vinted_favoris": int(a.get("favoris") or 0),
                 "vinted_vues": int(a.get("vues") or 0),
+                "photo_url": str(a.get("photo") or "") or None,
                 "source": "Vinted",
                 "synced_at": today,
             }, on_conflict="vinted_item_id").execute()
