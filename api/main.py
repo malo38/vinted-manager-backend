@@ -22,6 +22,21 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")          # service_role (accès complet)
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")  # anon (valide les tokens utilisateurs)
 
+# ── Suivi d'erreurs (Sentry) ──────────────────────────────────────────────
+# Inactif tant que SENTRY_DSN n'est pas défini (créez un compte gratuit sur
+# sentry.io, projet FastAPI/Python, et collez le DSN dans les variables
+# d'environnement Railway). Sans ça, aucun changement de comportement.
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+if SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.1, send_default_pii=False)
+
+def capture_error(exc: Exception):
+    """Envoie l'erreur à Sentry si configuré (no-op sinon)."""
+    if SENTRY_DSN:
+        import sentry_sdk
+        sentry_sdk.capture_exception(exc)
+
 app = FastAPI(title="Vinted Manager — Sync Backend", version="1.0.0")
 
 # Autorise les appels depuis le site Vercel et l'extension Chrome
@@ -141,6 +156,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             })
         except Exception as e:
             print(f"[SYNC ERROR] annonce {vinted_id} (construction): {e}")
+            capture_error(e)
     if annonce_rows:
         annonce_rows = dedupe_by_key(annonce_rows, "vinted_item_id")
         try:
@@ -148,12 +164,14 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             articles_upserted += len(annonce_rows)
         except Exception as e:
             print(f"[SYNC ERROR] annonces batch ({len(annonce_rows)} lignes): {e}")
+            capture_error(e)
     if stats_rows:
         stats_rows = dedupe_by_key(stats_rows, "vinted_item_id")
         try:
             sb.table("vinted_stats_history").upsert(stats_rows, on_conflict="vinted_item_id,stat_date").execute()
         except Exception as e:
             print(f"[SYNC ERROR] stats_history batch ({len(stats_rows)} lignes): {e}")
+            capture_error(e)
 
     # ── Ventes → articles "vendu" ─────────────────────────────────────────────
     vente_rows = []
@@ -178,6 +196,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             })
         except Exception as e:
             print(f"[SYNC ERROR] vente {vinted_id} (construction): {e}")
+            capture_error(e)
     if vente_rows:
         vente_rows = dedupe_by_key(vente_rows, "vinted_item_id")
         try:
@@ -185,6 +204,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             articles_upserted += len(vente_rows)
         except Exception as e:
             print(f"[SYNC ERROR] ventes batch ({len(vente_rows)} lignes): {e}")
+            capture_error(e)
 
     # ── Achats → table vinted_purchases (dépenses) ────────────────────────────
     achat_rows = []
@@ -206,6 +226,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             })
         except Exception as e:
             print(f"[SYNC ERROR] achat {vinted_id} (construction): {e}")
+            capture_error(e)
     if achat_rows:
         achat_rows = dedupe_by_key(achat_rows, "id")
         try:
@@ -213,6 +234,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             purchases_upserted += len(achat_rows)
         except Exception as e:
             print(f"[SYNC ERROR] achats batch ({len(achat_rows)} lignes): {e}")
+            capture_error(e)
 
     # ── Messages → table conversations ───────────────────────────────────────
     message_rows = []
@@ -234,6 +256,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             })
         except Exception as e:
             print(f"[SYNC ERROR] message {conv_id} (construction): {e}")
+            capture_error(e)
     if message_rows:
         message_rows = dedupe_by_key(message_rows, "id")
         try:
@@ -241,6 +264,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             messages_upserted += len(message_rows)
         except Exception as e:
             print(f"[SYNC ERROR] messages batch ({len(message_rows)} lignes): {e}")
+            capture_error(e)
 
     # ── Mettre à jour le statut de connexion Vinted de l'utilisateur ─────────
     if payload.vinted_login:
@@ -259,6 +283,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             }, on_conflict="user_id").execute()
         except Exception as e:
             print(f"[SYNC ERROR] vinted_accounts {user_id}: {e}")
+            capture_error(e)
 
     return {
         "ok": True,
