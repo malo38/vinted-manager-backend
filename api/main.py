@@ -188,6 +188,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "updated_at": str(m.get("updated_at") or "")[:30] or None,
                 "est_offre": bool(m.get("est_offre") or False),
                 "offre_prix": float(m["offre_prix"]) if m.get("offre_prix") is not None else None,
+                "article_titre": str(m.get("article_titre") or "")[:255],
             }, on_conflict="id").execute()
             messages_upserted += 1
         except Exception:
