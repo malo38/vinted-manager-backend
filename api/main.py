@@ -147,6 +147,8 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "photo_url": str(v.get("photo") or "") or None,
                 "source": "Vinted",
                 "synced_at": today,
+                "vinted_shipping_status": str(v.get("statut") or "")[:255],
+                "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
             }, on_conflict="vinted_item_id").execute()
             articles_upserted += 1
         except Exception as e:
@@ -167,6 +169,8 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "purchase_date": str(p.get("date_achat") or "")[:10] or None,
                 "photo_url": str(p.get("photo") or "") or None,
                 "synced_at": today,
+                "status": str(p.get("statut") or "")[:255],
+                "transaction_status": str(p.get("statut_code") or "")[:50],
             }, on_conflict="id").execute()
             purchases_upserted += 1
         except Exception as e:
