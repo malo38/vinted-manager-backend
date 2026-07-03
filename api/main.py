@@ -89,6 +89,16 @@ class SyncPayload(BaseModel):
     messages: list = []    # conversations
 
 
+def dedupe_by_key(rows: list, key: str) -> list:
+    """Garde la dernière occurrence de chaque valeur de `key`.
+    Nécessaire pour les upserts en lot : Postgres refuse qu'un même
+    ON CONFLICT touche deux fois la même ligne dans un seul appel."""
+    seen = {}
+    for row in rows:
+        seen[row[key]] = row
+    return list(seen.values())
+
+
 @app.post("/api/extension/sync")
 def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user_id)):
     """
@@ -99,14 +109,17 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     today = date.today().isoformat()
 
     articles_upserted = 0
+    purchases_upserted = 0
+    messages_upserted = 0
 
-    # ── Annonces actives → articles "stock" ─────────────────────────────────
+    # ── Annonces actives → articles "stock" (upsert en un seul appel) ────────
+    annonce_rows, stats_rows = [], []
     for a in payload.annonces:
         vinted_id = str(a.get("id") or "")
         if not vinted_id:
             continue
         try:
-            sb.table("articles").upsert({
+            annonce_rows.append({
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
                 "name": str(a.get("titre") or "")[:255],
@@ -118,25 +131,38 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "photo_url": str(a.get("photo") or "") or None,
                 "source": "Vinted",
                 "synced_at": today,
-            }, on_conflict="vinted_item_id").execute()
-            articles_upserted += 1
-            sb.table("vinted_stats_history").upsert({
+            })
+            stats_rows.append({
                 "user_id": user_id,
                 "vinted_item_id": vinted_id,
                 "stat_date": today,
                 "vues": int(a.get("vues") or 0),
                 "favoris": int(a.get("favoris") or 0),
-            }, on_conflict="vinted_item_id,stat_date").execute()
+            })
         except Exception as e:
-            print(f"[SYNC ERROR] annonce {vinted_id}: {e}")
+            print(f"[SYNC ERROR] annonce {vinted_id} (construction): {e}")
+    if annonce_rows:
+        annonce_rows = dedupe_by_key(annonce_rows, "vinted_item_id")
+        try:
+            sb.table("articles").upsert(annonce_rows, on_conflict="vinted_item_id").execute()
+            articles_upserted += len(annonce_rows)
+        except Exception as e:
+            print(f"[SYNC ERROR] annonces batch ({len(annonce_rows)} lignes): {e}")
+    if stats_rows:
+        stats_rows = dedupe_by_key(stats_rows, "vinted_item_id")
+        try:
+            sb.table("vinted_stats_history").upsert(stats_rows, on_conflict="vinted_item_id,stat_date").execute()
+        except Exception as e:
+            print(f"[SYNC ERROR] stats_history batch ({len(stats_rows)} lignes): {e}")
 
-    # ── Ventes → articles "vendu" ────────────────────────────────────────────
+    # ── Ventes → articles "vendu" ─────────────────────────────────────────────
+    vente_rows = []
     for v in payload.ventes:
         vinted_id = str(v.get("id") or "")
         if not vinted_id:
             continue
         try:
-            sb.table("articles").upsert({
+            vente_rows.append({
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
                 "name": str(v.get("titre") or "")[:255],
@@ -149,19 +175,25 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
                 "vinted_shipping_status": str(v.get("statut") or "")[:255],
                 "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
-            }, on_conflict="vinted_item_id").execute()
-            articles_upserted += 1
+            })
         except Exception as e:
-            print(f"[SYNC ERROR] vente {vinted_id}: {e}")
+            print(f"[SYNC ERROR] vente {vinted_id} (construction): {e}")
+    if vente_rows:
+        vente_rows = dedupe_by_key(vente_rows, "vinted_item_id")
+        try:
+            sb.table("articles").upsert(vente_rows, on_conflict="vinted_item_id").execute()
+            articles_upserted += len(vente_rows)
+        except Exception as e:
+            print(f"[SYNC ERROR] ventes batch ({len(vente_rows)} lignes): {e}")
 
     # ── Achats → table vinted_purchases (dépenses) ────────────────────────────
-    purchases_upserted = 0
+    achat_rows = []
     for p in payload.achats:
         vinted_id = str(p.get("id") or "")
         if not vinted_id:
             continue
         try:
-            sb.table("vinted_purchases").upsert({
+            achat_rows.append({
                 "id": vinted_id,
                 "user_id": user_id,
                 "title": str(p.get("titre") or "")[:255],
@@ -171,19 +203,25 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
                 "status": str(p.get("statut") or "")[:255],
                 "transaction_status": str(p.get("statut_code") or "")[:50],
-            }, on_conflict="id").execute()
-            purchases_upserted += 1
+            })
         except Exception as e:
-            print(f"[SYNC ERROR] achat {vinted_id}: {e}")
+            print(f"[SYNC ERROR] achat {vinted_id} (construction): {e}")
+    if achat_rows:
+        achat_rows = dedupe_by_key(achat_rows, "id")
+        try:
+            sb.table("vinted_purchases").upsert(achat_rows, on_conflict="id").execute()
+            purchases_upserted += len(achat_rows)
+        except Exception as e:
+            print(f"[SYNC ERROR] achats batch ({len(achat_rows)} lignes): {e}")
 
     # ── Messages → table conversations ───────────────────────────────────────
-    messages_upserted = 0
+    message_rows = []
     for m in payload.messages:
         conv_id = str(m.get("id") or "")
         if not conv_id:
             continue
         try:
-            sb.table("vinted_conversations").upsert({
+            message_rows.append({
                 "id": conv_id,
                 "user_id": user_id,
                 "interlocuteur": str(m.get("interlocuteur") or "")[:100],
@@ -193,10 +231,16 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "est_offre": bool(m.get("est_offre") or False),
                 "offre_prix": float(m["offre_prix"]) if m.get("offre_prix") is not None else None,
                 "article_titre": str(m.get("article_titre") or "")[:255],
-            }, on_conflict="id").execute()
-            messages_upserted += 1
+            })
         except Exception as e:
-            print(f"[SYNC ERROR] message {conv_id}: {e}")
+            print(f"[SYNC ERROR] message {conv_id} (construction): {e}")
+    if message_rows:
+        message_rows = dedupe_by_key(message_rows, "id")
+        try:
+            sb.table("vinted_conversations").upsert(message_rows, on_conflict="id").execute()
+            messages_upserted += len(message_rows)
+        except Exception as e:
+            print(f"[SYNC ERROR] messages batch ({len(message_rows)} lignes): {e}")
 
     # ── Mettre à jour le statut de connexion Vinted de l'utilisateur ─────────
     if payload.vinted_login:
