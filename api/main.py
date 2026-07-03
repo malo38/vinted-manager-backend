@@ -82,6 +82,7 @@ def root():
 class SyncPayload(BaseModel):
     vinted_user_id: str = ""
     vinted_login: str = ""
+    reputation: dict = {}  # avis, note, abonnés, nb d'articles
     ventes: list = []      # articles vendus
     achats: list = []      # articles achetés (côté acheteur)
     annonces: list = []    # articles en vente (avec favoris/vues)
@@ -119,6 +120,13 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
             }, on_conflict="vinted_item_id").execute()
             articles_upserted += 1
+            sb.table("vinted_stats_history").upsert({
+                "user_id": user_id,
+                "vinted_item_id": vinted_id,
+                "stat_date": today,
+                "vues": int(a.get("vues") or 0),
+                "favoris": int(a.get("favoris") or 0),
+            }, on_conflict="vinted_item_id,stat_date").execute()
         except Exception as e:
             print(f"[SYNC ERROR] annonce {vinted_id}: {e}")
 
@@ -186,12 +194,17 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # ── Mettre à jour le statut de connexion Vinted de l'utilisateur ─────────
     if payload.vinted_login:
         try:
+            rep = payload.reputation or {}
             sb.table("vinted_accounts").upsert({
                 "user_id": user_id,
                 "vinted_login": payload.vinted_login,
                 "vinted_user_id": payload.vinted_user_id,
                 "last_sync": today,
                 "connected": True,
+                "review_count": int(rep.get("review_count") or 0),
+                "feedback_reputation": float(rep.get("feedback_reputation") or 0),
+                "followers_count": int(rep.get("followers_count") or 0),
+                "vinted_item_count": int(rep.get("item_count") or 0),
             }, on_conflict="user_id").execute()
         except Exception:
             pass
