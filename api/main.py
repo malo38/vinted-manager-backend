@@ -231,8 +231,42 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if achat_rows:
         achat_rows = dedupe_by_key(achat_rows, "id")
         try:
+            # On repère les achats qui n'existaient pas encore avant cette synchro
+            # (donc jamais vus) pour créer automatiquement leur article de stock —
+            # sans ça, chaque resynchro re-upserterait les mêmes lignes et on ne
+            # pourrait plus distinguer un achat historique d'un nouveau.
+            existing = sb.table("vinted_purchases").select("id").eq("user_id", user_id) \
+                .in_("id", [r["id"] for r in achat_rows]).execute()
+            existing_ids = {row["id"] for row in (existing.data or [])}
+            new_rows = [r for r in achat_rows if r["id"] not in existing_ids]
+
             sb.table("vinted_purchases").upsert(achat_rows, on_conflict="id").execute()
             purchases_upserted += len(achat_rows)
+
+            # Conversion auto en stock (étape "à laver") : uniquement les tout
+            # nouveaux achats, pour ne pas transformer rétroactivement tout
+            # l'historique en stock au moment de la mise en prod de cette
+            # fonctionnalité (voir supabase_purchase_stock_link.sql). Un achat déjà
+            # remboursé/annulé ("failed") n'est jamais arrivé : pas d'article créé.
+            if new_rows:
+                article_rows = [{
+                    "vinted_item_id": r["id"],
+                    "user_id": user_id,
+                    "name": r["title"][:255],
+                    "buy_price": r["price"],
+                    "buy_date": r["purchase_date"],
+                    "platform": "Vinted",
+                    "status": "laver",
+                    "photo_url": r["photo_url"],
+                    "source": "Vinted",
+                    "synced_at": today,
+                } for r in new_rows if r["transaction_status"] != "failed"]
+                if article_rows:
+                    sb.table("articles").upsert(article_rows, on_conflict="vinted_item_id").execute()
+                # On marque tous les nouveaux achats comme traités (même les remboursés),
+                # pour ne plus jamais les revérifier lors des prochaines synchros.
+                sb.table("vinted_purchases").update({"stock_created": True}).eq("user_id", user_id) \
+                    .in_("id", [r["id"] for r in new_rows]).execute()
         except Exception as e:
             print(f"[SYNC ERROR] achats batch ({len(achat_rows)} lignes): {e}")
             capture_error(e)
