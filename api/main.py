@@ -452,3 +452,64 @@ def get_sent_messages(user_id: str = Depends(get_current_user_id)):
     return {"messages": res.data or []}
 
 
+# ============================================================
+# ROUTE: Prix du marché (recherche publique Vinted)
+# ============================================================
+
+import requests as req_lib
+
+_VINTED_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+
+@app.get("/api/vinted/market-price")
+def market_price(query: str, user_id: str = Depends(get_current_user_id)):
+    """
+    Recherche publique sur Vinted (comme n'importe quel visiteur non connecté)
+    pour donner une idée du prix du marché sur un mot-clé donné.
+    Confirmé le 2026-07-04 : GET /api/v2/catalog/items fonctionne avec une
+    simple session anonyme (visite de la page d'accueil pour les cookies).
+    """
+    query = query.strip()
+    if not query or len(query) < 2:
+        raise HTTPException(status_code=400, detail="Recherche trop courte.")
+
+    headers = {"User-Agent": _VINTED_UA, "Accept": "application/json"}
+    session = req_lib.Session()
+    try:
+        session.get("https://www.vinted.fr/", headers=headers, timeout=10)
+        r = session.get(
+            "https://www.vinted.fr/api/v2/catalog/items",
+            params={"search_text": query, "per_page": "50"},
+            headers=headers,
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        capture_error(e)
+        raise HTTPException(status_code=502, detail="Impossible de contacter Vinted pour le moment.")
+
+    prices = []
+    for item in data.get("items", []):
+        try:
+            prices.append(float(item["price"]["amount"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if not prices:
+        return {"count": 0}
+
+    prices.sort()
+    n = len(prices)
+    mid = n // 2
+    median = prices[mid] if n % 2 else (prices[mid - 1] + prices[mid]) / 2
+
+    return {
+        "count": n,
+        "average": round(sum(prices) / n, 2),
+        "median": round(median, 2),
+        "min": prices[0],
+        "max": prices[-1],
+    }
+
+
