@@ -129,10 +129,28 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     messages_upserted = 0
 
     # ── Annonces actives → articles "stock" (upsert en un seul appel) ────────
+    # /wardrobe/{userId}/items (voir background.js) peut encore lister un
+    # article après sa vente (et /my_orders?order_type=sold ne renvoie que les
+    # ~100 ventes les plus récentes, sans pagination) : sans ce garde-fou, une
+    # synchro ultérieure qui ne voit plus la vente dans "ventes" mais voit
+    # toujours l'article dans "annonces" repasserait son statut à "stock" —
+    # ce qui faussait le stock affiché ET le chiffre d'affaires/bénéfice
+    # (signalé par un utilisateur le 2026-07-11).
+    annonce_ids = [str(a.get("id") or "") for a in payload.annonces if a.get("id")]
+    vendu_ids = set()
+    if annonce_ids:
+        try:
+            existing = sb.table("articles").select("vinted_item_id,status") \
+                .eq("user_id", user_id).in_("vinted_item_id", annonce_ids).execute()
+            vendu_ids = {r["vinted_item_id"] for r in (existing.data or []) if r["status"] == "vendu"}
+        except Exception as e:
+            print(f"[SYNC ERROR] check statut vendu: {e}")
+            capture_error(e)
+
     annonce_rows, stats_rows = [], []
     for a in payload.annonces:
         vinted_id = str(a.get("id") or "")
-        if not vinted_id:
+        if not vinted_id or vinted_id in vendu_ids:
             continue
         try:
             annonce_rows.append({
