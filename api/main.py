@@ -245,7 +245,24 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] stats_history batch ({len(stats_rows)} lignes): {e}")
             capture_error(e)
 
-    # ── Ventes → articles "vendu" ─────────────────────────────────────────────
+    # ── Ventes → articles "à expédier" puis "vendu" une fois expédié ─────────
+    # Une vente fraîchement détectée doit atterrir en "à expédier" (l'acheteur
+    # a payé mais le colis n'est pas encore parti), pas directement en
+    # "vendu" — sinon l'étape d'expédition est silencieusement sautée. Ne
+    # jamais faire régresser un article déjà marqué "vendu" (expédié) : même
+    # garde-fou que pour le statut "stock" des annonces plus haut (une
+    # resynchro ne doit jamais défaire une progression manuelle).
+    vente_ids = [str(v.get("id") or "") for v in payload.ventes if v.get("id")]
+    already_vendu_ids = set()
+    if vente_ids:
+        try:
+            existing_ventes = sb.table("articles").select("vinted_item_id,status") \
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", vente_ids).execute()
+            already_vendu_ids = {r["vinted_item_id"] for r in (existing_ventes.data or []) if r["status"] == "vendu"}
+        except Exception as e:
+            print(f"[SYNC ERROR] check statut déjà vendu: {e}")
+            capture_error(e)
+
     vente_rows = []
     for v in payload.ventes:
         vinted_id = str(v.get("id") or "")
@@ -259,7 +276,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "name": str(v.get("titre") or "")[:255],
                 "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
-                "status": "vendu",
+                "status": "vendu" if vinted_id in already_vendu_ids else "expedition",
                 "sell_date": str(v.get("date_vente") or "")[:10] or None,
                 "photo_url": str(v.get("photo") or "") or None,
                 "source": "Vinted",
