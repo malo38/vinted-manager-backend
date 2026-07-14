@@ -115,6 +115,28 @@ def dedupe_by_key(rows: list, key: str) -> list:
     return list(seen.values())
 
 
+def resolve_vinted_account_id(sb: Client, user_id: str, vinted_user_id: str = "", vinted_account_id: str = "") -> str | None:
+    """
+    Résout la ligne `vinted_accounts` concernée par un appel (un utilisateur
+    VintControl peut avoir plusieurs comptes Vinted connectés en parallèle).
+    Priorité : `vinted_account_id` explicite (le site le connaît déjà via
+    /api/extension/accounts) > `vinted_user_id` (l'extension le connaît via
+    la session Vinted active) > repli sur le compte le plus récemment
+    synchronisé de cet utilisateur (compatibilité avec un ancien
+    site/extension qui n'envoie encore ni l'un ni l'autre).
+    """
+    if vinted_account_id:
+        return vinted_account_id
+    if vinted_user_id:
+        res = sb.table("vinted_accounts").select("id").eq("user_id", user_id) \
+            .eq("vinted_user_id", vinted_user_id).limit(1).execute()
+        if res.data:
+            return res.data[0]["id"]
+    res = sb.table("vinted_accounts").select("id").eq("user_id", user_id) \
+        .order("last_sync", desc=True).limit(1).execute()
+    return res.data[0]["id"] if res.data else None
+
+
 @app.post("/api/extension/sync")
 def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user_id)):
     """
@@ -123,6 +145,35 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     """
     sb = get_supabase()
     today = date.today().isoformat()
+
+    # ── Résout (ou crée) le compte Vinted concerné, en tout premier ──────────
+    # Un utilisateur VintControl peut avoir plusieurs comptes Vinted connectés
+    # en parallèle désormais : toutes les tables ci-dessous doivent être
+    # rattachées explicitement à CE compte, plus au seul user_id.
+    if not payload.vinted_login or not payload.vinted_user_id:
+        raise HTTPException(status_code=400, detail="vinted_login/vinted_user_id manquant : impossible d'identifier le compte Vinted à synchroniser.")
+
+    rep = payload.reputation or {}
+    wallet = payload.wallet or {}
+    try:
+        account_res = sb.table("vinted_accounts").upsert({
+            "user_id": user_id,
+            "vinted_login": payload.vinted_login,
+            "vinted_user_id": payload.vinted_user_id,
+            "last_sync": today,
+            "connected": True,
+            "review_count": int(rep.get("review_count") or 0),
+            "feedback_reputation": float(rep.get("feedback_reputation") or 0),
+            "followers_count": int(rep.get("followers_count") or 0),
+            "vinted_item_count": int(rep.get("item_count") or 0),
+            "wallet_balance": float(wallet.get("balance") or 0),
+            "wallet_pending_balance": float(wallet.get("pending_balance") or 0),
+        }, on_conflict="user_id,vinted_user_id").execute()
+        vinted_account_id = account_res.data[0]["id"]
+    except Exception as e:
+        print(f"[SYNC ERROR] vinted_accounts {user_id}: {e}")
+        capture_error(e)
+        raise HTTPException(status_code=502, detail="Échec de la résolution du compte Vinted, synchro annulée.")
 
     articles_upserted = 0
     purchases_upserted = 0
@@ -141,7 +192,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if annonce_ids:
         try:
             existing = sb.table("articles").select("vinted_item_id,status") \
-                .eq("user_id", user_id).in_("vinted_item_id", annonce_ids).execute()
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", annonce_ids).execute()
             vendu_ids = {r["vinted_item_id"] for r in (existing.data or []) if r["status"] == "vendu"}
         except Exception as e:
             print(f"[SYNC ERROR] check statut vendu: {e}")
@@ -156,6 +207,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             annonce_rows.append({
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
                 "name": str(a.get("titre") or "")[:255],
                 "sell_price": float(a.get("prix") or 0),
                 "platform": "Vinted",
@@ -168,6 +220,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             })
             stats_rows.append({
                 "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
                 "vinted_item_id": vinted_id,
                 "stat_date": today,
                 "vues": int(a.get("vues") or 0),
@@ -179,7 +232,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if annonce_rows:
         annonce_rows = dedupe_by_key(annonce_rows, "vinted_item_id")
         try:
-            sb.table("articles").upsert(annonce_rows, on_conflict="vinted_item_id").execute()
+            sb.table("articles").upsert(annonce_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
             articles_upserted += len(annonce_rows)
         except Exception as e:
             print(f"[SYNC ERROR] annonces batch ({len(annonce_rows)} lignes): {e}")
@@ -187,7 +240,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if stats_rows:
         stats_rows = dedupe_by_key(stats_rows, "vinted_item_id")
         try:
-            sb.table("vinted_stats_history").upsert(stats_rows, on_conflict="vinted_item_id,stat_date").execute()
+            sb.table("vinted_stats_history").upsert(stats_rows, on_conflict="vinted_account_id,vinted_item_id,stat_date").execute()
         except Exception as e:
             print(f"[SYNC ERROR] stats_history batch ({len(stats_rows)} lignes): {e}")
             capture_error(e)
@@ -202,6 +255,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             vente_rows.append({
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
                 "name": str(v.get("titre") or "")[:255],
                 "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
@@ -219,7 +273,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if vente_rows:
         vente_rows = dedupe_by_key(vente_rows, "vinted_item_id")
         try:
-            sb.table("articles").upsert(vente_rows, on_conflict="vinted_item_id").execute()
+            sb.table("articles").upsert(vente_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
             articles_upserted += len(vente_rows)
         except Exception as e:
             print(f"[SYNC ERROR] ventes batch ({len(vente_rows)} lignes): {e}")
@@ -235,6 +289,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             achat_rows.append({
                 "id": vinted_id,
                 "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
                 "title": str(p.get("titre") or "")[:255],
                 "price": float(p.get("prix") or 0),
                 "purchase_date": str(p.get("date_achat") or "")[:10] or None,
@@ -254,7 +309,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             # sans ça, chaque resynchro re-upserterait les mêmes lignes et on ne
             # pourrait plus distinguer un achat historique d'un nouveau.
             existing = sb.table("vinted_purchases").select("id").eq("user_id", user_id) \
-                .in_("id", [r["id"] for r in achat_rows]).execute()
+                .eq("vinted_account_id", vinted_account_id).in_("id", [r["id"] for r in achat_rows]).execute()
             existing_ids = {row["id"] for row in (existing.data or [])}
             new_rows = [r for r in achat_rows if r["id"] not in existing_ids]
 
@@ -270,6 +325,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 article_rows = [{
                     "vinted_item_id": r["id"],
                     "user_id": user_id,
+                    "vinted_account_id": vinted_account_id,
                     "name": r["title"][:255],
                     "buy_price": r["price"],
                     "buy_date": r["purchase_date"],
@@ -280,7 +336,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                     "synced_at": today,
                 } for r in new_rows if r["transaction_status"] != "failed"]
                 if article_rows:
-                    sb.table("articles").upsert(article_rows, on_conflict="vinted_item_id").execute()
+                    sb.table("articles").upsert(article_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
                 # On marque tous les nouveaux achats comme traités (même les remboursés),
                 # pour ne plus jamais les revérifier lors des prochaines synchros.
                 sb.table("vinted_purchases").update({"stock_created": True}).eq("user_id", user_id) \
@@ -299,6 +355,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             message_rows.append({
                 "id": conv_id,
                 "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
                 "interlocuteur": str(m.get("interlocuteur") or "")[:100],
                 "dernier_message": str(m.get("dernier_message") or "")[:500],
                 "non_lu": bool(m.get("non_lu") or False),
@@ -319,28 +376,6 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] messages batch ({len(message_rows)} lignes): {e}")
             capture_error(e)
 
-    # ── Mettre à jour le statut de connexion Vinted de l'utilisateur ─────────
-    if payload.vinted_login:
-        try:
-            rep = payload.reputation or {}
-            wallet = payload.wallet or {}
-            sb.table("vinted_accounts").upsert({
-                "user_id": user_id,
-                "vinted_login": payload.vinted_login,
-                "vinted_user_id": payload.vinted_user_id,
-                "last_sync": today,
-                "connected": True,
-                "review_count": int(rep.get("review_count") or 0),
-                "feedback_reputation": float(rep.get("feedback_reputation") or 0),
-                "followers_count": int(rep.get("followers_count") or 0),
-                "vinted_item_count": int(rep.get("item_count") or 0),
-                "wallet_balance": float(wallet.get("balance") or 0),
-                "wallet_pending_balance": float(wallet.get("pending_balance") or 0),
-            }, on_conflict="user_id").execute()
-        except Exception as e:
-            print(f"[SYNC ERROR] vinted_accounts {user_id}: {e}")
-            capture_error(e)
-
     return {
         "ok": True,
         "articles_upserted": articles_upserted,
@@ -355,8 +390,12 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
 
 @app.get("/api/extension/status")
 def extension_status(user_id: str = Depends(get_current_user_id)):
+    """Conservé pour compatibilité avec un ancien popup d'extension : renvoie
+    le compte le plus récemment synchronisé. Pour la vraie liste multicompte,
+    voir GET /api/extension/accounts."""
     sb = get_supabase()
-    res = sb.table("vinted_accounts").select("*").eq("user_id", user_id).limit(1).execute()
+    res = sb.table("vinted_accounts").select("*").eq("user_id", user_id) \
+        .order("last_sync", desc=True).limit(1).execute()
     if not res.data:
         return {"connected": False}
     account = res.data[0]
@@ -368,13 +407,52 @@ def extension_status(user_id: str = Depends(get_current_user_id)):
 
 
 # ============================================================
+# ROUTE: Liste des comptes Vinted connectés (multicompte)
+# ============================================================
+
+@app.get("/api/extension/accounts")
+def list_vinted_accounts(user_id: str = Depends(get_current_user_id)):
+    sb = get_supabase()
+    res = sb.table("vinted_accounts").select("*").eq("user_id", user_id) \
+        .order("last_sync", desc=True).execute()
+    return {"accounts": res.data or []}
+
+
+# ============================================================
 # ROUTE: Déconnexion Vinted
 # ============================================================
 
+class DisconnectPayload(BaseModel):
+    vinted_account_id: str = ""
+
+
 @app.post("/api/extension/disconnect")
-def extension_disconnect(user_id: str = Depends(get_current_user_id)):
+def extension_disconnect(payload: DisconnectPayload = DisconnectPayload(), user_id: str = Depends(get_current_user_id)):
+    """
+    Déconnecte un compte Vinted (soft — ne supprime aucune donnée historique,
+    juste connected=False, comme avant). Si `vinted_account_id` n'est pas
+    fourni (ancien extension/site pas encore à jour), déconnecte le compte le
+    plus récemment synchronisé — préserve exactement le comportement d'avant
+    pour un utilisateur avec un seul compte connecté.
+    """
     sb = get_supabase()
-    sb.table("vinted_accounts").update({"connected": False}).eq("user_id", user_id).execute()
+    account_id = payload.vinted_account_id or resolve_vinted_account_id(sb, user_id)
+    if not account_id:
+        return {"ok": True}
+    sb.table("vinted_accounts").update({"connected": False}) \
+        .eq("id", account_id).eq("user_id", user_id).execute()
+    return {"ok": True}
+
+
+@app.post("/api/extension/accounts/{account_id}/disconnect")
+def disconnect_account(account_id: str, user_id: str = Depends(get_current_user_id)):
+    """Déconnecte UN compte Vinted précis par son id interne, sans affecter
+    les autres comptes connectés de cet utilisateur."""
+    sb = get_supabase()
+    res = sb.table("vinted_accounts").update({"connected": False}) \
+        .eq("id", account_id).eq("user_id", user_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Compte introuvable.")
     return {"ok": True}
 
 
@@ -401,15 +479,21 @@ def get_debug_notifications(user_id: str = Depends(get_current_user_id)):
 
 
 @app.get("/api/extension/automessage-config")
-def automessage_config(user_id: str = Depends(get_current_user_id)):
+def automessage_config(vinted_user_id: str = "", vinted_account_id: str = "", user_id: str = Depends(get_current_user_id)):
     """
     Réglages de l'envoi automatique de messages aux favoris, lus par l'extension
     avant chaque cycle, ainsi que le nombre déjà envoyé aujourd'hui (pour le plafond).
+    Réglages désormais PAR COMPTE Vinted : `vinted_user_id` (connu de
+    l'extension via la session live) ou `vinted_account_id` (connu du site)
+    identifie le compte concerné.
     """
     sb = get_supabase()
     today = date.today().isoformat()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id, vinted_account_id)
 
-    res = sb.table("vinted_automessage_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    settings_query = sb.table("vinted_automessage_settings").select("*")
+    settings_query = settings_query.eq("vinted_account_id", account_id) if account_id else settings_query.eq("user_id", user_id)
+    res = settings_query.limit(1).execute()
     settings = res.data[0] if res.data else {
         "enabled": False,
         "template": "",
@@ -418,13 +502,13 @@ def automessage_config(user_id: str = Depends(get_current_user_id)):
         "daily_limit": 20,
     }
 
-    sent_res = (
+    sent_query = (
         sb.table("vinted_sent_messages")
         .select("id", count="exact")
-        .eq("user_id", user_id)
         .gte("sent_at", f"{today}T00:00:00")
-        .execute()
     )
+    sent_query = sent_query.eq("vinted_account_id", account_id) if account_id else sent_query.eq("user_id", user_id)
+    sent_res = sent_query.execute()
     sent_today = sent_res.count or 0
 
     return {
@@ -443,21 +527,28 @@ class AutomessageSettingsPayload(BaseModel):
     delay_min_sec: int = 60
     delay_max_sec: int = 180
     daily_limit: int = 20
+    vinted_account_id: str = ""
 
 
 @app.post("/api/settings/automessage")
 def save_automessage_settings(payload: AutomessageSettingsPayload, user_id: str = Depends(get_current_user_id)):
-    """Enregistre les réglages de l'envoi automatique depuis le site."""
+    """Enregistre les réglages de l'envoi automatique depuis le site, pour le
+    compte Vinted sélectionné (`vinted_account_id`, envoyé par le
+    sélecteur de compte du site)."""
     sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_account_id=payload.vinted_account_id)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté à configurer.")
     sb.table("vinted_automessage_settings").upsert({
         "user_id": user_id,
+        "vinted_account_id": account_id,
         "enabled": payload.enabled,
         "template": payload.template[:1000],
         "delay_min_sec": max(10, payload.delay_min_sec),
         "delay_max_sec": max(payload.delay_min_sec, payload.delay_max_sec),
         "daily_limit": max(0, payload.daily_limit),
         "updated_at": datetime.utcnow().isoformat(),
-    }, on_conflict="user_id").execute()
+    }, on_conflict="vinted_account_id").execute()
     return {"ok": True}
 
 
@@ -468,6 +559,7 @@ class MarkMessagedPayload(BaseModel):
     item_id: str = ""
     item_title: str = ""
     message: str = ""
+    vinted_user_id: str = ""
 
 
 @app.post("/api/extension/mark-messaged")
@@ -477,9 +569,11 @@ def mark_messaged(payload: MarkMessagedPayload, user_id: str = Depends(get_curre
     Vinted pour être idempotent (jamais deux fois le même favori, même après réinstallation).
     """
     sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id=payload.vinted_user_id)
     sb.table("vinted_sent_messages").upsert({
         "id": payload.id,
         "user_id": user_id,
+        "vinted_account_id": account_id,
         "recipient_login": payload.recipient_login[:100],
         "recipient_id": payload.recipient_id,
         "item_id": payload.item_id,
@@ -490,17 +584,15 @@ def mark_messaged(payload: MarkMessagedPayload, user_id: str = Depends(get_curre
 
 
 @app.get("/api/extension/sent-messages")
-def get_sent_messages(user_id: str = Depends(get_current_user_id)):
-    """Historique des messages auto-envoyés, pour affichage sur le site."""
+def get_sent_messages(vinted_account_id: str = "", user_id: str = Depends(get_current_user_id)):
+    """Historique des messages auto-envoyés, pour affichage sur le site.
+    Filtré par compte si `vinted_account_id` est fourni (sélecteur de compte
+    du site), sinon renvoie l'historique de tous les comptes de l'utilisateur."""
     sb = get_supabase()
-    res = (
-        sb.table("vinted_sent_messages")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("sent_at", desc=True)
-        .limit(50)
-        .execute()
-    )
+    query = sb.table("vinted_sent_messages").select("*").eq("user_id", user_id)
+    if vinted_account_id:
+        query = query.eq("vinted_account_id", vinted_account_id)
+    res = query.order("sent_at", desc=True).limit(50).execute()
     return {"messages": res.data or []}
 
 
@@ -509,16 +601,20 @@ def get_sent_messages(user_id: str = Depends(get_current_user_id)):
 # ============================================================
 
 @app.get("/api/extension/republish-config")
-def republish_config(user_id: str = Depends(get_current_user_id)):
+def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user_id: str = Depends(get_current_user_id)):
     """
     Réglages de la republication automatique, lus par l'extension avant
     chaque cycle, avec la liste des articles Vinted éligibles (pas republiés
     depuis au moins `frequency_days`) et le nombre déjà republié aujourd'hui.
+    Réglages PAR COMPTE Vinted, comme automessage-config.
     """
     sb = get_supabase()
     today = date.today().isoformat()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id, vinted_account_id)
 
-    res = sb.table("vinted_republish_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    settings_query = sb.table("vinted_republish_settings").select("*")
+    settings_query = settings_query.eq("vinted_account_id", account_id) if account_id else settings_query.eq("user_id", user_id)
+    res = settings_query.limit(1).execute()
     settings = res.data[0] if res.data else {
         "enabled": False,
         "frequency_days": 3,
@@ -528,26 +624,27 @@ def republish_config(user_id: str = Depends(get_current_user_id)):
     frequency_days = int(settings.get("frequency_days") or 3)
     daily_limit = int(settings.get("daily_limit") or 5)
 
-    done_today_res = (
+    done_today_query = (
         sb.table("vinted_republish_log")
         .select("article_id", count="exact")
-        .eq("user_id", user_id)
         .gte("last_republished_at", f"{today}T00:00:00")
-        .execute()
     )
+    done_today_query = done_today_query.eq("vinted_account_id", account_id) if account_id else done_today_query.eq("user_id", user_id)
+    done_today_res = done_today_query.execute()
     republished_today = done_today_res.count or 0
 
     eligible_vinted_item_ids = []
     if enabled and republished_today < daily_limit:
-        articles_res = (
+        articles_query = (
             sb.table("articles")
             .select("id,vinted_item_id")
             .eq("user_id", user_id)
             .eq("status", "stock")
             .eq("platform", "Vinted")
             .not_.is_("vinted_item_id", "null")
-            .execute()
         )
+        articles_query = articles_query.eq("vinted_account_id", account_id) if account_id else articles_query
+        articles_res = articles_query.execute()
         candidates = articles_res.data or []
         article_ids = [a["id"] for a in candidates]
         log_res = (
@@ -577,25 +674,32 @@ class RepublishSettingsPayload(BaseModel):
     enabled: bool = False
     frequency_days: int = 3
     daily_limit: int = 5
+    vinted_account_id: str = ""
 
 
 @app.post("/api/settings/republish")
 def save_republish_settings(payload: RepublishSettingsPayload, user_id: str = Depends(get_current_user_id)):
-    """Enregistre les réglages de republication automatique depuis le site."""
+    """Enregistre les réglages de republication automatique depuis le site,
+    pour le compte Vinted sélectionné."""
     sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_account_id=payload.vinted_account_id)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté à configurer.")
     sb.table("vinted_republish_settings").upsert({
         "user_id": user_id,
+        "vinted_account_id": account_id,
         "enabled": payload.enabled,
         "frequency_days": max(1, payload.frequency_days),
         "daily_limit": max(0, payload.daily_limit),
         "updated_at": datetime.utcnow().isoformat(),
-    }, on_conflict="user_id").execute()
+    }, on_conflict="vinted_account_id").execute()
     return {"ok": True}
 
 
 class MarkRepublishedPayload(BaseModel):
     old_vinted_item_id: str
     new_vinted_item_id: str
+    vinted_user_id: str = ""
 
 
 @app.post("/api/extension/mark-republished")
@@ -606,14 +710,15 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
     enregistre la date de republication pour respecter frequency_days ensuite.
     """
     sb = get_supabase()
-    existing = (
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id=payload.vinted_user_id)
+    existing_query = (
         sb.table("articles")
         .select("id")
         .eq("user_id", user_id)
         .eq("vinted_item_id", payload.old_vinted_item_id)
-        .limit(1)
-        .execute()
     )
+    existing_query = existing_query.eq("vinted_account_id", account_id) if account_id else existing_query
+    existing = existing_query.limit(1).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Article introuvable pour cet ancien vinted_item_id.")
     article_id = existing.data[0]["id"]
@@ -626,6 +731,7 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
     sb.table("vinted_republish_log").upsert({
         "article_id": article_id,
         "user_id": user_id,
+        "vinted_account_id": account_id,
         "last_republished_at": datetime.utcnow().isoformat(),
     }, on_conflict="article_id").execute()
 
