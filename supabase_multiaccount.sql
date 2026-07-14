@@ -31,6 +31,11 @@
 ALTER TABLE vinted_accounts ADD COLUMN IF NOT EXISTS id UUID DEFAULT gen_random_uuid();
 UPDATE vinted_accounts SET id = gen_random_uuid() WHERE id IS NULL;
 ALTER TABLE vinted_accounts ALTER COLUMN id SET NOT NULL;
+-- `id` doit être UNIQUE dès maintenant : les colonnes vinted_account_id
+-- ajoutées plus bas la référencent en clé étrangère, et Postgres exige une
+-- contrainte unique sur la colonne référencée pour l'autoriser (la vraie
+-- clé primaire, elle, n'arrive qu'en partie 1b).
+ALTER TABLE vinted_accounts ADD CONSTRAINT vinted_accounts_id_unique UNIQUE (id);
 
 -- Avant de continuer : vérifiez qu'aucune ligne n'a un vinted_user_id vide
 -- (compte jamais synchronisé) — ça n'empêche rien (NULL n'entre pas en
@@ -131,6 +136,9 @@ NOTIFY pgrst, 'reload schema';
 -- --   SELECT conname FROM pg_constraint WHERE conrelid = 'vinted_accounts'::regclass AND contype = 'p';
 -- ALTER TABLE vinted_accounts DROP CONSTRAINT IF EXISTS vinted_accounts_pkey;
 -- ALTER TABLE vinted_accounts ADD PRIMARY KEY (id);
+-- -- La contrainte UNIQUE temporaire posée en 1a devient redondante une fois
+-- -- la vraie PRIMARY KEY en place (qui est elle-même UNIQUE) :
+-- ALTER TABLE vinted_accounts DROP CONSTRAINT IF EXISTS vinted_accounts_id_unique;
 --
 -- NOTIFY pgrst, 'reload schema';
 
