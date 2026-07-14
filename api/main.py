@@ -9,7 +9,7 @@ Aucune donnée sensible (mot de passe) n'est jamais stockée.
 """
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -502,6 +502,134 @@ def get_sent_messages(user_id: str = Depends(get_current_user_id)):
         .execute()
     )
     return {"messages": res.data or []}
+
+
+# ============================================================
+# ROUTE: Republication automatique des annonces
+# ============================================================
+
+@app.get("/api/extension/republish-config")
+def republish_config(user_id: str = Depends(get_current_user_id)):
+    """
+    Réglages de la republication automatique, lus par l'extension avant
+    chaque cycle, avec la liste des articles Vinted éligibles (pas republiés
+    depuis au moins `frequency_days`) et le nombre déjà republié aujourd'hui.
+    """
+    sb = get_supabase()
+    today = date.today().isoformat()
+
+    res = sb.table("vinted_republish_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    settings = res.data[0] if res.data else {
+        "enabled": False,
+        "frequency_days": 3,
+        "daily_limit": 5,
+    }
+    enabled = bool(settings.get("enabled"))
+    frequency_days = int(settings.get("frequency_days") or 3)
+    daily_limit = int(settings.get("daily_limit") or 5)
+
+    done_today_res = (
+        sb.table("vinted_republish_log")
+        .select("article_id", count="exact")
+        .eq("user_id", user_id)
+        .gte("last_republished_at", f"{today}T00:00:00")
+        .execute()
+    )
+    republished_today = done_today_res.count or 0
+
+    eligible_vinted_item_ids = []
+    if enabled and republished_today < daily_limit:
+        articles_res = (
+            sb.table("articles")
+            .select("id,vinted_item_id")
+            .eq("user_id", user_id)
+            .eq("status", "stock")
+            .eq("platform", "Vinted")
+            .not_.is_("vinted_item_id", "null")
+            .execute()
+        )
+        candidates = articles_res.data or []
+        article_ids = [a["id"] for a in candidates]
+        log_res = (
+            sb.table("vinted_republish_log")
+            .select("article_id,last_republished_at")
+            .in_("article_id", article_ids)
+            .execute()
+            if article_ids else None
+        )
+        cutoff = datetime.utcnow() - timedelta(days=frequency_days)
+        last_republished = {r["article_id"]: r["last_republished_at"] for r in (log_res.data if log_res else [])}
+        for a in candidates:
+            last = last_republished.get(a["id"])
+            if last is None or datetime.fromisoformat(last.replace("Z", "+00:00")).replace(tzinfo=None) < cutoff:
+                eligible_vinted_item_ids.append(a["vinted_item_id"])
+
+    return {
+        "enabled": enabled,
+        "frequency_days": frequency_days,
+        "daily_limit": daily_limit,
+        "republished_today": republished_today,
+        "eligible_vinted_item_ids": eligible_vinted_item_ids,
+    }
+
+
+class RepublishSettingsPayload(BaseModel):
+    enabled: bool = False
+    frequency_days: int = 3
+    daily_limit: int = 5
+
+
+@app.post("/api/settings/republish")
+def save_republish_settings(payload: RepublishSettingsPayload, user_id: str = Depends(get_current_user_id)):
+    """Enregistre les réglages de republication automatique depuis le site."""
+    sb = get_supabase()
+    sb.table("vinted_republish_settings").upsert({
+        "user_id": user_id,
+        "enabled": payload.enabled,
+        "frequency_days": max(1, payload.frequency_days),
+        "daily_limit": max(0, payload.daily_limit),
+        "updated_at": datetime.utcnow().isoformat(),
+    }, on_conflict="user_id").execute()
+    return {"ok": True}
+
+
+class MarkRepublishedPayload(BaseModel):
+    old_vinted_item_id: str
+    new_vinted_item_id: str
+
+
+@app.post("/api/extension/mark-republished")
+def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Après une republication réussie (delete + recreate), met à jour l'article
+    interne pour pointer vers le nouvel id Vinted (l'ancien n'existe plus) et
+    enregistre la date de republication pour respecter frequency_days ensuite.
+    """
+    sb = get_supabase()
+    existing = (
+        sb.table("articles")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("vinted_item_id", payload.old_vinted_item_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Article introuvable pour cet ancien vinted_item_id.")
+    article_id = existing.data[0]["id"]
+
+    sb.table("articles").update({
+        "vinted_item_id": payload.new_vinted_item_id,
+        "synced_at": date.today().isoformat(),
+    }).eq("id", article_id).execute()
+
+    sb.table("vinted_republish_log").upsert({
+        "article_id": article_id,
+        "user_id": user_id,
+        "last_republished_at": datetime.utcnow().isoformat(),
+    }, on_conflict="article_id").execute()
+
+    return {"ok": True}
 
 
 # ============================================================
