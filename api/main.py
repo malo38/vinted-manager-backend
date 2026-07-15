@@ -745,6 +745,25 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
         "synced_at": date.today().isoformat(),
     }).eq("id", article_id).execute()
 
+    # Nettoyage d'un cas limite rare mais réel : si une synchro s'est
+    # déclenchée pile entre la création de la nouvelle annonce et la
+    # suppression de l'ancienne (delete+recreate volontairement dans cet
+    # ordre pour la sécurité), Vinted renvoyait encore l'ancien id comme
+    # actif à ce moment précis — une ligne orpheline a pu être créée pour
+    # cet ancien id, jamais nettoyée depuis puisque Vinted ne le renvoie
+    # plus jamais dans les synchros suivantes. On la supprime ici, juste
+    # après avoir renommé la ligne d'origine, pour ne jamais la laisser
+    # traîner en double dans le stock de l'utilisateur.
+    delete_query = (
+        sb.table("articles")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("vinted_item_id", payload.old_vinted_item_id)
+        .neq("id", article_id)
+    )
+    delete_query = delete_query.eq("vinted_account_id", account_id) if account_id else delete_query
+    delete_query.execute()
+
     sb.table("vinted_republish_log").upsert({
         "article_id": article_id,
         "user_id": user_id,
