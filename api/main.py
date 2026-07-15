@@ -143,9 +143,19 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
     if name:
         norm_name = name.strip().lower()
         if norm_name:
-            candidates = sb.table("articles").select("sku,name") \
-                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id) \
-                .neq("status", "vendu").execute()
+            # Pour une annonce ou un achat, un article déjà "vendu" est exclu
+            # des candidats (on ne veut pas rouvrir un item déjà écoulé comme
+            # s'il était encore en stock). Pour une VENTE en revanche, exclure
+            # les "vendu" empêchait de reconnaître qu'une vente déjà traitée
+            # (mais sans lien enregistré, ex: articles antérieurs à la
+            # migration SKU) était la même que celle qu'on resynchronise —
+            # ça créait un doublon au lieu de la retrouver (signalé le
+            # 2026-07-15, juste après la mise en place de ce système).
+            query = sb.table("articles").select("sku,name") \
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id)
+            if context != "order_sale":
+                query = query.neq("status", "vendu")
+            candidates = query.execute()
             for c in (candidates.data or []):
                 if (c.get("name") or "").strip().lower() == norm_name:
                     sku = c["sku"]
