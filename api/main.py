@@ -9,6 +9,7 @@ Aucune donnée sensible (mot de passe) n'est jamais stockée.
 """
 
 import os
+import uuid
 from datetime import date, datetime, timedelta
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,6 +116,54 @@ def dedupe_by_key(rows: list, key: str) -> list:
     return list(seen.values())
 
 
+def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, create_defaults=None):
+    """
+    Traduit un id Vinted (annonce / commande de vente / commande d'achat) en
+    SKU stable — l'identifiant qu'ON génère et qui ne change jamais, contrairement
+    aux id Vinted qui sont DIFFÉRENTS selon qu'on regarde le même article physique
+    comme annonce, comme vente ou comme achat (cause des doublons stock/vendu et
+    des fiches "Lot N articles" fantômes, signalé le 2026-07-15).
+
+    1. Cherche un lien déjà connu (vinted_links) pour cet id précis.
+    2. Sinon, tente un rapprochement par nom exact parmi les articles pas
+       encore vendus du même compte (typiquement : un achat déjà importé en
+       stock, qu'on vient de retrouver publié sous un nouvel id d'annonce, ou
+       une vente d'un article déjà en stock).
+    3. Sinon, si `create_defaults` est fourni, crée un nouvel article + son
+       sku + le lien. Sinon retourne None (appelant : mettre en file d'attente
+       de réconciliation plutôt que fabriquer une fausse fiche de stock).
+    """
+    if not vinted_id:
+        return None
+
+    link_res = sb.table("vinted_links").select("sku").eq("context", context).eq("vinted_id", vinted_id).execute()
+    if link_res.data:
+        return link_res.data[0]["sku"]
+
+    if name:
+        norm_name = name.strip().lower()
+        if norm_name:
+            candidates = sb.table("articles").select("sku,name") \
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id) \
+                .neq("status", "vendu").execute()
+            for c in (candidates.data or []):
+                if (c.get("name") or "").strip().lower() == norm_name:
+                    sku = c["sku"]
+                    sb.table("vinted_links").upsert(
+                        {"sku": sku, "context": context, "vinted_id": vinted_id},
+                        on_conflict="context,vinted_id",
+                    ).execute()
+                    return sku
+
+    if create_defaults is not None:
+        new_sku = uuid.uuid4().hex[:8]
+        sb.table("articles").insert({**create_defaults, "sku": new_sku}).execute()
+        sb.table("vinted_links").insert({"sku": new_sku, "context": context, "vinted_id": vinted_id}).execute()
+        return new_sku
+
+    return None
+
+
 def resolve_vinted_account_id(sb: Client, user_id: str, vinted_user_id: str = "", vinted_account_id: str = "") -> str | None:
     """
     Résout la ligne `vinted_accounts` concernée par un appel (un utilisateur
@@ -191,30 +240,75 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # exception au garde-fou ci-dessous, une seule fois : un article modifié
     # manuellement dans VintControl mais dont l'état réel diverge de Vinted
     # doit pouvoir être totalement réécrasé par la vraie donnée du moment.
-    resync_ids = set()
-    annonce_ids = [str(a.get("id") or "") for a in payload.annonces if a.get("id")]
-    vendu_ids = set()
-    if annonce_ids:
+    # Résolution par SKU (voir resolve_sku) plutôt que par vinted_item_id brut :
+    # une annonce peut correspondre à un article déjà connu sous un tout autre
+    # id Vinted (ex: acheté via VintControl puis republié — l'id d'annonce n'a
+    # aucun rapport avec l'id de la commande d'achat d'origine).
+    resync_ids = set()   # skus avec force_resync actif
+    vendu_skus = set()   # skus déjà vendus, à ne jamais faire régresser
+
+    annonce_links = {}
+    for a in payload.annonces:
+        vinted_id = str(a.get("id") or "")
+        if not vinted_id:
+            continue
         try:
-            existing = sb.table("articles").select("vinted_item_id,status,force_resync") \
-                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", annonce_ids).execute()
-            vendu_ids = {r["vinted_item_id"] for r in (existing.data or []) if r["status"] == "vendu" and not r.get("force_resync")}
-            resync_ids |= {r["vinted_item_id"] for r in (existing.data or []) if r.get("force_resync")}
+            sku = resolve_sku(sb, user_id, vinted_account_id, "listing", vinted_id, name=str(a.get("titre") or ""))
         except Exception as e:
-            print(f"[SYNC ERROR] check statut vendu: {e}")
+            print(f"[SYNC ERROR] resolve_sku annonce {vinted_id}: {e}")
+            capture_error(e)
+            continue
+        if sku:
+            annonce_links[vinted_id] = sku
+
+    if annonce_links:
+        try:
+            skus = list(set(annonce_links.values()))
+            existing = sb.table("articles").select("sku,status,force_resync").in_("sku", skus).execute()
+            for r in (existing.data or []):
+                if r["status"] == "vendu" and not r.get("force_resync"):
+                    vendu_skus.add(r["sku"])
+                if r.get("force_resync"):
+                    resync_ids.add(r["sku"])
+        except Exception as e:
+            print(f"[SYNC ERROR] check statut vendu (annonces): {e}")
             capture_error(e)
 
     annonce_rows, stats_rows = [], []
     for a in payload.annonces:
         vinted_id = str(a.get("id") or "")
-        if not vinted_id or vinted_id in vendu_ids:
+        if not vinted_id:
             continue
+        sku = annonce_links.get(vinted_id)
+        if sku and sku in vendu_skus:
+            continue
+        name = str(a.get("titre") or "")[:255]
         try:
+            if not sku:
+                # Jamais vu ni rapproché : nouvel article, créé directement par
+                # resolve_sku avec ces valeurs par défaut — rien à upserter en plus.
+                resolve_sku(sb, user_id, vinted_account_id, "listing", vinted_id, name=name, create_defaults={
+                    "user_id": user_id,
+                    "vinted_account_id": vinted_account_id,
+                    "name": name,
+                    "sell_price": float(a.get("prix") or 0),
+                    "platform": "Vinted",
+                    "status": "stock",
+                    "vinted_item_id": vinted_id,
+                    "vinted_favoris": int(a.get("favoris") or 0),
+                    "vinted_vues": int(a.get("vues") or 0),
+                    "photo_url": str(a.get("photo") or "") or None,
+                    "source": "Vinted",
+                    "synced_at": today,
+                })
+                articles_upserted += 1
+                continue
             annonce_rows.append({
+                "sku": sku,
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
                 "vinted_account_id": vinted_account_id,
-                "name": str(a.get("titre") or "")[:255],
+                "name": name,
                 "sell_price": float(a.get("prix") or 0),
                 "platform": "Vinted",
                 "status": "stock",
@@ -236,9 +330,9 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] annonce {vinted_id} (construction): {e}")
             capture_error(e)
     if annonce_rows:
-        annonce_rows = dedupe_by_key(annonce_rows, "vinted_item_id")
+        annonce_rows = dedupe_by_key(annonce_rows, "sku")
         try:
-            sb.table("articles").upsert(annonce_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
+            sb.table("articles").upsert(annonce_rows, on_conflict="sku").execute()
             articles_upserted += len(annonce_rows)
         except Exception as e:
             print(f"[SYNC ERROR] annonces batch ({len(annonce_rows)} lignes): {e}")
@@ -256,62 +350,88 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # a payé mais le colis n'est pas encore parti), pas directement en
     # "vendu" — sinon l'étape d'expédition est silencieusement sautée. Ne
     # jamais faire régresser un article déjà marqué "vendu" (expédié) : même
-    # garde-fou que pour le statut "stock" des annonces plus haut (une
-    # resynchro ne doit jamais défaire une progression manuelle).
-    # L'id d'ANNONCE (item_id, résolu par l'extension via /conversations/{id})
-    # prime sur l'id de COMMANDE (id) quand il est disponible : c'est le même
-    # identifiant que celui utilisé pour la fiche "stock" de cet article avant
-    # sa vente, donc l'upsert plus bas (on_conflict vinted_account_id+vinted_item_id)
-    # met à jour la fiche existante au lieu d'en créer une nouvelle. Sans item_id
-    # (ex: commande "lot" groupant plusieurs articles, sans item_id unique côté
-    # Vinted), on retombe sur l'id de commande comme avant — cause des doublons
-    # stock/vendu et des fiches "Lot N articles" fantômes signalés le 2026-07-15.
+    # garde-fou que pour le statut "stock" des annonces plus haut.
+    #
+    # Résolution par SKU (resolve_sku, contexte "order_sale") : on essaie
+    # l'item_id résolu par l'extension (même id que l'annonce d'origine),
+    # puis un rapprochement par nom. Si rien ne correspond, on NE FABRIQUE
+    # PLUS de fausse fiche de stock (ancienne source des "Lot N articles"
+    # fantômes) — la vente part en file d'attente `unmatched_sales` pour
+    # réconciliation manuelle sur le site (signalé le 2026-07-15).
     def vente_key(v):
         return str(v.get("item_id") or v.get("id") or "")
 
-    vente_ids = [vente_key(v) for v in payload.ventes if vente_key(v)]
-    already_vendu_ids = set()
-    if vente_ids:
-        try:
-            existing_ventes = sb.table("articles").select("vinted_item_id,status,force_resync") \
-                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", vente_ids).execute()
-            already_vendu_ids = {r["vinted_item_id"] for r in (existing_ventes.data or []) if r["status"] == "vendu" and not r.get("force_resync")}
-            resync_ids |= {r["vinted_item_id"] for r in (existing_ventes.data or []) if r.get("force_resync")}
-        except Exception as e:
-            print(f"[SYNC ERROR] check statut déjà vendu: {e}")
-            capture_error(e)
-
-    # Vinted donne déjà le vrai statut de la transaction (statut_code) — jusqu'ici
-    # on l'ignorait et on mettait TOUTE vente détectée en "à expédier", même une
-    # commande "completed" livrée depuis des années (import initial d'un vieil
-    # historique de ventes) ou une commande "failed"/remboursée qui n'a jamais
-    # abouti. Résultat signalé le 2026-07-15 : des ventes de 2023 restaient
-    # bloquées en "à expédier" pour toujours, et des ventes annulées polluaient
-    # le stock actif comme si elles étaient encore en cours.
     FAILED_TRANSACTION_STATUSES = {"failed", "cancelled", "canceled"}
     COMPLETED_TRANSACTION_STATUSES = {"completed"}
 
-    vente_rows = []
+    vente_links = {}
     for v in payload.ventes:
         vinted_id = vente_key(v)
         if not vinted_id:
             continue
         statut_code = str(v.get("statut_code") or "").strip().lower()
         # Vente annulée/remboursée : elle n'a jamais réellement abouti, on ne
-        # la fait pas apparaître comme un article actif (ni "à expédier" ni
-        # "vendu") — sinon elle traîne indéfiniment dans le stock.
+        # crée ni article ni entrée de réconciliation.
         if statut_code in FAILED_TRANSACTION_STATUSES:
             continue
-        if statut_code in COMPLETED_TRANSACTION_STATUSES:
-            status = "vendu"
-        else:
-            status = "vendu" if vinted_id in already_vendu_ids else "expedition"
         try:
+            sku = resolve_sku(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=str(v.get("titre") or ""))
+        except Exception as e:
+            print(f"[SYNC ERROR] resolve_sku vente {vinted_id}: {e}")
+            capture_error(e)
+            continue
+        if sku:
+            vente_links[vinted_id] = sku
+
+    vendu_skus_ventes = set()
+    if vente_links:
+        try:
+            skus = list(set(vente_links.values()))
+            existing_ventes = sb.table("articles").select("sku,status,force_resync").in_("sku", skus).execute()
+            for r in (existing_ventes.data or []):
+                if r["status"] == "vendu" and not r.get("force_resync"):
+                    vendu_skus_ventes.add(r["sku"])
+                if r.get("force_resync"):
+                    resync_ids.add(r["sku"])
+        except Exception as e:
+            print(f"[SYNC ERROR] check statut déjà vendu (ventes): {e}")
+            capture_error(e)
+
+    vente_rows, unmatched_rows = [], []
+    for v in payload.ventes:
+        vinted_id = vente_key(v)
+        if not vinted_id:
+            continue
+        statut_code = str(v.get("statut_code") or "").strip().lower()
+        if statut_code in FAILED_TRANSACTION_STATUSES:
+            continue
+        sku = vente_links.get(vinted_id)
+        name = str(v.get("titre") or "")[:255]
+        try:
+            if not sku:
+                # Aucune correspondance fiable : file de réconciliation plutôt
+                # qu'une fiche de stock fantôme.
+                unmatched_rows.append({
+                    "user_id": user_id,
+                    "vinted_account_id": vinted_account_id,
+                    "vinted_order_id": vinted_id,
+                    "name": name,
+                    "sell_price": float(v.get("prix") or 0),
+                    "sell_date": str(v.get("date_vente") or "")[:10] or None,
+                    "photo_url": str(v.get("photo") or "") or None,
+                    "vinted_shipping_status": str(v.get("statut") or "")[:255],
+                    "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
+                })
+                continue
+            if sku in vendu_skus_ventes:
+                continue
+            status = "vendu" if statut_code in COMPLETED_TRANSACTION_STATUSES else "expedition"
             vente_rows.append({
+                "sku": sku,
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
                 "vinted_account_id": vinted_account_id,
-                "name": str(v.get("titre") or "")[:255],
+                "name": name,
                 "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
                 "status": status,
@@ -326,12 +446,19 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] vente {vinted_id} (construction): {e}")
             capture_error(e)
     if vente_rows:
-        vente_rows = dedupe_by_key(vente_rows, "vinted_item_id")
+        vente_rows = dedupe_by_key(vente_rows, "sku")
         try:
-            sb.table("articles").upsert(vente_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
+            sb.table("articles").upsert(vente_rows, on_conflict="sku").execute()
             articles_upserted += len(vente_rows)
         except Exception as e:
             print(f"[SYNC ERROR] ventes batch ({len(vente_rows)} lignes): {e}")
+            capture_error(e)
+    if unmatched_rows:
+        unmatched_rows = dedupe_by_key(unmatched_rows, "vinted_order_id")
+        try:
+            sb.table("unmatched_sales").upsert(unmatched_rows, on_conflict="user_id,vinted_order_id").execute()
+        except Exception as e:
+            print(f"[SYNC ERROR] unmatched_sales batch ({len(unmatched_rows)} lignes): {e}")
             capture_error(e)
 
     # Le passe-droit force_resync ne vaut que pour ce cycle : une fois la
@@ -340,7 +467,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     if resync_ids:
         try:
             sb.table("articles").update({"force_resync": False}) \
-                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", list(resync_ids)).execute()
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("sku", list(resync_ids)).execute()
         except Exception as e:
             print(f"[SYNC ERROR] clear force_resync: {e}")
             capture_error(e)
@@ -387,22 +514,31 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             # l'historique en stock au moment de la mise en prod de cette
             # fonctionnalité (voir supabase_purchase_stock_link.sql). Un achat déjà
             # remboursé/annulé ("failed") n'est jamais arrivé : pas d'article créé.
+            # resolve_sku (contexte "order_purchase") enregistre le lien id
+            # d'achat ↔ sku : si ce même article réapparaît plus tard sous un
+            # id d'annonce ou de vente Vinted différent, le rapprochement par
+            # nom (voir resolve_sku) pourra encore le retrouver.
             if new_rows:
-                article_rows = [{
-                    "vinted_item_id": r["id"],
-                    "user_id": user_id,
-                    "vinted_account_id": vinted_account_id,
-                    "name": r["title"][:255],
-                    "buy_price": r["price"],
-                    "buy_date": r["purchase_date"],
-                    "platform": "Vinted",
-                    "status": "laver",
-                    "photo_url": r["photo_url"],
-                    "source": "Vinted",
-                    "synced_at": today,
-                } for r in new_rows if r["transaction_status"] != "failed"]
-                if article_rows:
-                    sb.table("articles").upsert(article_rows, on_conflict="vinted_account_id,vinted_item_id").execute()
+                for r in new_rows:
+                    if r["transaction_status"] == "failed":
+                        continue
+                    try:
+                        resolve_sku(sb, user_id, vinted_account_id, "order_purchase", r["id"], name=r["title"], create_defaults={
+                            "user_id": user_id,
+                            "vinted_account_id": vinted_account_id,
+                            "name": r["title"][:255],
+                            "buy_price": r["price"],
+                            "buy_date": r["purchase_date"],
+                            "platform": "Vinted",
+                            "status": "laver",
+                            "vinted_item_id": r["id"],
+                            "photo_url": r["photo_url"],
+                            "source": "Vinted",
+                            "synced_at": today,
+                        })
+                    except Exception as e:
+                        print(f"[SYNC ERROR] resolve_sku achat {r['id']}: {e}")
+                        capture_error(e)
                 # On marque tous les nouveaux achats comme traités (même les remboursés),
                 # pour ne plus jamais les revérifier lors des prochaines synchros.
                 sb.table("vinted_purchases").update({"stock_created": True}).eq("user_id", user_id) \
@@ -810,7 +946,7 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
     account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id=payload.vinted_user_id)
     existing_query = (
         sb.table("articles")
-        .select("id")
+        .select("id,sku")
         .eq("user_id", user_id)
         .eq("vinted_item_id", payload.old_vinted_item_id)
     )
@@ -819,11 +955,22 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
     if not existing.data:
         raise HTTPException(status_code=404, detail="Article introuvable pour cet ancien vinted_item_id.")
     article_id = existing.data[0]["id"]
+    sku = existing.data[0].get("sku")
 
     sb.table("articles").update({
         "vinted_item_id": payload.new_vinted_item_id,
         "synced_at": date.today().isoformat(),
     }).eq("id", article_id).execute()
+
+    # Le lien "listing" doit suivre le nouvel id — sinon le prochain sync ne
+    # reconnaît plus cet article via vinted_links et retombe sur le
+    # rapprochement par nom (voir resolve_sku), moins fiable.
+    if sku:
+        sb.table("vinted_links").delete().eq("context", "listing").eq("vinted_id", payload.old_vinted_item_id).execute()
+        sb.table("vinted_links").upsert(
+            {"sku": sku, "context": "listing", "vinted_id": payload.new_vinted_item_id},
+            on_conflict="context,vinted_id",
+        ).execute()
 
     # Nettoyage d'un cas limite rare mais réel : si une synchro s'est
     # déclenchée pile entre la création de la nouvelle annonce et la
