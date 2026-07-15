@@ -844,6 +844,28 @@ def resync_article(payload: ResyncArticlePayload, user_id: str = Depends(get_cur
     return {"ok": True}
 
 
+class ResyncAllPayload(BaseModel):
+    vinted_account_id: str = ""
+
+
+@app.post("/api/settings/resync-all")
+def resync_all(payload: ResyncAllPayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Même principe que resync-article, mais pour tous les articles Vinted du
+    compte à la fois — chacun sera réécrasé par la vraie donnée Vinted à sa
+    prochaine apparition dans annonces/ventes (≤5 min pour ceux encore actifs
+    ou vendus ; ceux qui ont disparu de Vinted entièrement, ni annonce ni
+    vente, ne seront pas touchés par ce mécanisme).
+    """
+    sb = get_supabase()
+    query = sb.table("articles").update({"force_resync": True}) \
+        .eq("user_id", user_id).eq("platform", "Vinted").not_.is_("vinted_item_id", "null")
+    if payload.vinted_account_id:
+        query = query.eq("vinted_account_id", payload.vinted_account_id)
+    res = query.execute()
+    return {"ok": True, "count": len(res.data or [])}
+
+
 # ============================================================
 # ROUTE: Prix du marché (recherche publique Vinted)
 # ============================================================
