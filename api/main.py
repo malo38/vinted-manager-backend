@@ -258,7 +258,18 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # jamais faire régresser un article déjà marqué "vendu" (expédié) : même
     # garde-fou que pour le statut "stock" des annonces plus haut (une
     # resynchro ne doit jamais défaire une progression manuelle).
-    vente_ids = [str(v.get("id") or "") for v in payload.ventes if v.get("id")]
+    # L'id d'ANNONCE (item_id, résolu par l'extension via /conversations/{id})
+    # prime sur l'id de COMMANDE (id) quand il est disponible : c'est le même
+    # identifiant que celui utilisé pour la fiche "stock" de cet article avant
+    # sa vente, donc l'upsert plus bas (on_conflict vinted_account_id+vinted_item_id)
+    # met à jour la fiche existante au lieu d'en créer une nouvelle. Sans item_id
+    # (ex: commande "lot" groupant plusieurs articles, sans item_id unique côté
+    # Vinted), on retombe sur l'id de commande comme avant — cause des doublons
+    # stock/vendu et des fiches "Lot N articles" fantômes signalés le 2026-07-15.
+    def vente_key(v):
+        return str(v.get("item_id") or v.get("id") or "")
+
+    vente_ids = [vente_key(v) for v in payload.ventes if vente_key(v)]
     already_vendu_ids = set()
     if vente_ids:
         try:
@@ -270,11 +281,31 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] check statut déjà vendu: {e}")
             capture_error(e)
 
+    # Vinted donne déjà le vrai statut de la transaction (statut_code) — jusqu'ici
+    # on l'ignorait et on mettait TOUTE vente détectée en "à expédier", même une
+    # commande "completed" livrée depuis des années (import initial d'un vieil
+    # historique de ventes) ou une commande "failed"/remboursée qui n'a jamais
+    # abouti. Résultat signalé le 2026-07-15 : des ventes de 2023 restaient
+    # bloquées en "à expédier" pour toujours, et des ventes annulées polluaient
+    # le stock actif comme si elles étaient encore en cours.
+    FAILED_TRANSACTION_STATUSES = {"failed", "cancelled", "canceled"}
+    COMPLETED_TRANSACTION_STATUSES = {"completed"}
+
     vente_rows = []
     for v in payload.ventes:
-        vinted_id = str(v.get("id") or "")
+        vinted_id = vente_key(v)
         if not vinted_id:
             continue
+        statut_code = str(v.get("statut_code") or "").strip().lower()
+        # Vente annulée/remboursée : elle n'a jamais réellement abouti, on ne
+        # la fait pas apparaître comme un article actif (ni "à expédier" ni
+        # "vendu") — sinon elle traîne indéfiniment dans le stock.
+        if statut_code in FAILED_TRANSACTION_STATUSES:
+            continue
+        if statut_code in COMPLETED_TRANSACTION_STATUSES:
+            status = "vendu"
+        else:
+            status = "vendu" if vinted_id in already_vendu_ids else "expedition"
         try:
             vente_rows.append({
                 "vinted_item_id": vinted_id,
@@ -283,7 +314,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "name": str(v.get("titre") or "")[:255],
                 "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
-                "status": "vendu" if vinted_id in already_vendu_ids else "expedition",
+                "status": status,
                 "sell_date": str(v.get("date_vente") or "")[:10] or None,
                 "photo_url": str(v.get("photo") or "") or None,
                 "source": "Vinted",
