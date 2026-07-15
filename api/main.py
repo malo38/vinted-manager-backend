@@ -678,13 +678,44 @@ def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user
             if last is None or datetime.fromisoformat(last.replace("Z", "+00:00")).replace(tzinfo=None) < cutoff:
                 eligible_vinted_item_ids.append(a["vinted_item_id"])
 
+    # Republication prioritaire (clic manuel "Republier maintenant" sur le
+    # site) : consommée une seule fois, indépendamment de enabled/daily_limit
+    # puisque c'est une action explicite de l'utilisateur, pas le cycle auto.
+    priority_item_id = settings.get("priority_item_id")
+    if priority_item_id and account_id:
+        sb.table("vinted_republish_settings").update({"priority_item_id": None}) \
+            .eq("vinted_account_id", account_id).execute()
+
     return {
         "enabled": enabled,
         "frequency_days": frequency_days,
         "daily_limit": daily_limit,
         "republished_today": republished_today,
         "eligible_vinted_item_ids": eligible_vinted_item_ids,
+        "priority_vinted_item_id": priority_item_id,
     }
+
+
+class RepublishNowPayload(BaseModel):
+    vinted_item_id: str
+    vinted_account_id: str = ""
+
+
+@app.post("/api/settings/republish-now")
+def republish_now(payload: RepublishNowPayload, user_id: str = Depends(get_current_user_id)):
+    """Marque un article pour republication prioritaire au tout prochain
+    cycle de synchro de l'extension (≤5 min), déclenché par le bouton
+    "Republier maintenant" du site — indépendant du réglage d'automatisation."""
+    sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_account_id=payload.vinted_account_id)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté.")
+    sb.table("vinted_republish_settings").upsert({
+        "vinted_account_id": account_id,
+        "user_id": user_id,
+        "priority_item_id": payload.vinted_item_id,
+    }, on_conflict="vinted_account_id").execute()
+    return {"ok": True}
 
 
 class RepublishSettingsPayload(BaseModel):
