@@ -187,13 +187,19 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # toujours l'article dans "annonces" repasserait son statut à "stock" —
     # ce qui faussait le stock affiché ET le chiffre d'affaires/bénéfice
     # (signalé par un utilisateur le 2026-07-11).
+    # force_resync (bouton "Réinitialiser depuis Vinted" sur le site) fait
+    # exception au garde-fou ci-dessous, une seule fois : un article modifié
+    # manuellement dans VintControl mais dont l'état réel diverge de Vinted
+    # doit pouvoir être totalement réécrasé par la vraie donnée du moment.
+    resync_ids = set()
     annonce_ids = [str(a.get("id") or "") for a in payload.annonces if a.get("id")]
     vendu_ids = set()
     if annonce_ids:
         try:
-            existing = sb.table("articles").select("vinted_item_id,status") \
+            existing = sb.table("articles").select("vinted_item_id,status,force_resync") \
                 .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", annonce_ids).execute()
-            vendu_ids = {r["vinted_item_id"] for r in (existing.data or []) if r["status"] == "vendu"}
+            vendu_ids = {r["vinted_item_id"] for r in (existing.data or []) if r["status"] == "vendu" and not r.get("force_resync")}
+            resync_ids |= {r["vinted_item_id"] for r in (existing.data or []) if r.get("force_resync")}
         except Exception as e:
             print(f"[SYNC ERROR] check statut vendu: {e}")
             capture_error(e)
@@ -256,9 +262,10 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     already_vendu_ids = set()
     if vente_ids:
         try:
-            existing_ventes = sb.table("articles").select("vinted_item_id,status") \
+            existing_ventes = sb.table("articles").select("vinted_item_id,status,force_resync") \
                 .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", vente_ids).execute()
-            already_vendu_ids = {r["vinted_item_id"] for r in (existing_ventes.data or []) if r["status"] == "vendu"}
+            already_vendu_ids = {r["vinted_item_id"] for r in (existing_ventes.data or []) if r["status"] == "vendu" and not r.get("force_resync")}
+            resync_ids |= {r["vinted_item_id"] for r in (existing_ventes.data or []) if r.get("force_resync")}
         except Exception as e:
             print(f"[SYNC ERROR] check statut déjà vendu: {e}")
             capture_error(e)
@@ -294,6 +301,17 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             articles_upserted += len(vente_rows)
         except Exception as e:
             print(f"[SYNC ERROR] ventes batch ({len(vente_rows)} lignes): {e}")
+            capture_error(e)
+
+    # Le passe-droit force_resync ne vaut que pour ce cycle : une fois la
+    # vraie donnée Vinted réappliquée ci-dessus, on remet le garde-fou normal
+    # en place pour la prochaine synchro.
+    if resync_ids:
+        try:
+            sb.table("articles").update({"force_resync": False}) \
+                .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id).in_("vinted_item_id", list(resync_ids)).execute()
+        except Exception as e:
+            print(f"[SYNC ERROR] clear force_resync: {e}")
             capture_error(e)
 
     # ── Achats → table vinted_purchases (dépenses) ────────────────────────────
@@ -802,6 +820,27 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
         "last_republished_at": datetime.utcnow().isoformat(),
     }, on_conflict="article_id").execute()
 
+    return {"ok": True}
+
+
+class ResyncArticlePayload(BaseModel):
+    id: str
+    vinted_account_id: str = ""
+
+
+@app.post("/api/settings/resync-article")
+def resync_article(payload: ResyncArticlePayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Marque un article pour être totalement réécrasé par la vraie donnée
+    Vinted au prochain cycle de synchro (≤5 min) — utilisé par le bouton
+    "Réinitialiser depuis Vinted" quand un changement manuel dans VintControl
+    a fait diverger le statut affiché de l'état réel sur Vinted.
+    """
+    sb = get_supabase()
+    res = sb.table("articles").update({"force_resync": True}) \
+        .eq("id", payload.id).eq("user_id", user_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Article introuvable.")
     return {"ok": True}
 
 
