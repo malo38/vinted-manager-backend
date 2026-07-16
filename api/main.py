@@ -502,6 +502,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "transaction_status": str(p.get("statut_code") or "")[:50],
                 "pickup_location": str(p.get("pickup_location") or "")[:500] or None,
                 "pickup_since": str(p.get("pickup_since") or "")[:10] or None,
+                "pickup_carrier": str(p.get("pickup_carrier") or "")[:50] or None,
             })
         except Exception as e:
             print(f"[SYNC ERROR] achat {vinted_id} (construction): {e}")
