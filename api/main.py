@@ -10,6 +10,7 @@ Aucune donnée sensible (mot de passe) n'est jamais stockée.
 
 import os
 import uuid
+from typing import Optional
 from datetime import date, datetime, timedelta
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -103,7 +104,13 @@ class SyncPayload(BaseModel):
     ventes: list = []      # articles vendus
     achats: list = []      # articles achetés (côté acheteur)
     annonces: list = []    # articles en vente (avec favoris/vues)
-    wardrobe_total: int = 0  # nb d'annonces vues avant filtrage is_closed (page 1, voir reconciliation suppressions)
+    # nb total d'annonces vues (toutes pages confondues, voir reconciliation
+    # suppressions) — Optional plutôt que 0 par défaut : un dressing Vinted
+    # devenu totalement vide après suppression de tout le stock envoie
+    # légitimement 0, à ne pas confondre avec une ancienne extension qui
+    # n'envoie pas du tout ce champ (absent => None => reconciliation ignorée
+    # par sécurité, un vrai 0 => reconciliation appliquée normalement).
+    wardrobe_total: Optional[int] = None
     messages: list = []    # conversations
 
 
@@ -362,11 +369,13 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # /wardrobe/{userId}/items ne renvoie plus du tout ces annonces (contrairement
     # à une vente, où is_closed passe à true mais l'annonce reste listée) : sans
     # ce nettoyage, un article resterait indéfiniment "en stock" chez VintControl
-    # après sa suppression sur Vinted (signalé le 2026-07-16). L'extension pagine
-    # maintenant tout le dressing (voir background.js) donc wardrobe_total reflète
-    # le total réel ; on exige juste une réponse non vide comme garde-fou contre
-    # une synchro partielle/en erreur qui viderait le stock à tort.
-    if payload.wardrobe_total > 0:
+    # après sa suppression sur Vinted (signalé le 2026-07-16). wardrobe_total=0
+    # est un cas légitime (dressing devenu totalement vide) — seule son absence
+    # (extension trop ancienne pour l'envoyer) doit désactiver ce nettoyage,
+    # d'où le test "is not None" plutôt que "> 0" (bug trouvé le 2026-07-16 :
+    # un compte n'ayant plus que les 2 annonces supprimées restait bloqué,
+    # wardrobe_total valant alors 0 après leur suppression).
+    if payload.wardrobe_total is not None:
         seen_ids = {str(a.get("id")) for a in payload.annonces if a.get("id")}
         try:
             live = sb.table("articles").select("sku,vinted_item_id").eq("vinted_account_id", vinted_account_id) \
