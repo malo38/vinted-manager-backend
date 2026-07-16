@@ -362,11 +362,11 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
     # /wardrobe/{userId}/items ne renvoie plus du tout ces annonces (contrairement
     # à une vente, où is_closed passe à true mais l'annonce reste listée) : sans
     # ce nettoyage, un article resterait indéfiniment "en stock" chez VintControl
-    # après sa suppression sur Vinted (signalé le 2026-07-16). On ne fait ce
-    # ménage que si wardrobe_total < 100 : au-delà, l'extension n'a récupéré que
-    # la 1ère page du dressing (voir background.js), et des annonces bien vivantes
-    # au-delà de la page 1 seraient sinon supprimées à tort.
-    if 0 < payload.wardrobe_total < 100:
+    # après sa suppression sur Vinted (signalé le 2026-07-16). L'extension pagine
+    # maintenant tout le dressing (voir background.js) donc wardrobe_total reflète
+    # le total réel ; on exige juste une réponse non vide comme garde-fou contre
+    # une synchro partielle/en erreur qui viderait le stock à tort.
+    if payload.wardrobe_total > 0:
         seen_ids = {str(a.get("id")) for a in payload.annonces if a.get("id")}
         try:
             live = sb.table("articles").select("sku,vinted_item_id").eq("vinted_account_id", vinted_account_id) \
