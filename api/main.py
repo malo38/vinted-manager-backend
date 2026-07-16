@@ -715,6 +715,7 @@ def automessage_config(vinted_user_id: str = "", vinted_account_id: str = "", us
         "delay_min_sec": 60,
         "delay_max_sec": 180,
         "daily_limit": 20,
+        "batch_size": 1,
     }
 
     sent_query = (
@@ -732,6 +733,7 @@ def automessage_config(vinted_user_id: str = "", vinted_account_id: str = "", us
         "delay_min_sec": int(settings.get("delay_min_sec") or 60),
         "delay_max_sec": int(settings.get("delay_max_sec") or 180),
         "daily_limit": int(settings.get("daily_limit") or 20),
+        "batch_size": max(1, int(settings.get("batch_size") or 1)),
         "sent_today": sent_today,
     }
 
@@ -742,6 +744,7 @@ class AutomessageSettingsPayload(BaseModel):
     delay_min_sec: int = 60
     delay_max_sec: int = 180
     daily_limit: int = 20
+    batch_size: int = 1
     vinted_account_id: str = ""
 
 
@@ -762,6 +765,7 @@ def save_automessage_settings(payload: AutomessageSettingsPayload, user_id: str 
         "delay_min_sec": max(10, payload.delay_min_sec),
         "delay_max_sec": max(payload.delay_min_sec, payload.delay_max_sec),
         "daily_limit": max(0, payload.daily_limit),
+        "batch_size": max(1, min(10, payload.batch_size)),
         "updated_at": datetime.utcnow().isoformat(),
     }, on_conflict="vinted_account_id").execute()
     return {"ok": True}
@@ -834,10 +838,12 @@ def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user
         "enabled": False,
         "frequency_days": 3,
         "daily_limit": 5,
+        "batch_size": 1,
     }
     enabled = bool(settings.get("enabled"))
     frequency_days = int(settings.get("frequency_days") or 3)
     daily_limit = int(settings.get("daily_limit") or 5)
+    batch_size = max(1, int(settings.get("batch_size") or 1))
 
     done_today_query = (
         sb.table("vinted_republish_log")
@@ -888,6 +894,7 @@ def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user
         "enabled": enabled,
         "frequency_days": frequency_days,
         "daily_limit": daily_limit,
+        "batch_size": batch_size,
         "republished_today": republished_today,
         "eligible_vinted_item_ids": eligible_vinted_item_ids,
         "priority_vinted_item_id": priority_item_id,
@@ -928,6 +935,7 @@ class RepublishSettingsPayload(BaseModel):
     enabled: bool = False
     frequency_days: int = 3
     daily_limit: int = 5
+    batch_size: int = 1
     vinted_account_id: str = ""
 
 
@@ -945,6 +953,7 @@ def save_republish_settings(payload: RepublishSettingsPayload, user_id: str = De
         "enabled": payload.enabled,
         "frequency_days": max(1, payload.frequency_days),
         "daily_limit": max(0, payload.daily_limit),
+        "batch_size": max(1, min(5, payload.batch_size)),
         "updated_at": datetime.utcnow().isoformat(),
     }, on_conflict="vinted_account_id").execute()
     return {"ok": True}
