@@ -103,6 +103,7 @@ class SyncPayload(BaseModel):
     ventes: list = []      # articles vendus
     achats: list = []      # articles achetés (côté acheteur)
     annonces: list = []    # articles en vente (avec favoris/vues)
+    wardrobe_total: int = 0  # nb d'annonces vues avant filtrage is_closed (page 1, voir reconciliation suppressions)
     messages: list = []    # conversations
 
 
@@ -355,6 +356,26 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             sb.table("vinted_stats_history").upsert(stats_rows, on_conflict="vinted_account_id,vinted_item_id,stat_date").execute()
         except Exception as e:
             print(f"[SYNC ERROR] stats_history batch ({len(stats_rows)} lignes): {e}")
+            capture_error(e)
+
+    # ── Annonces supprimées manuellement sur Vinted (bouton "Supprimer") ─────
+    # /wardrobe/{userId}/items ne renvoie plus du tout ces annonces (contrairement
+    # à une vente, où is_closed passe à true mais l'annonce reste listée) : sans
+    # ce nettoyage, un article resterait indéfiniment "en stock" chez VintControl
+    # après sa suppression sur Vinted (signalé le 2026-07-16). On ne fait ce
+    # ménage que si wardrobe_total < 100 : au-delà, l'extension n'a récupéré que
+    # la 1ère page du dressing (voir background.js), et des annonces bien vivantes
+    # au-delà de la page 1 seraient sinon supprimées à tort.
+    if 0 < payload.wardrobe_total < 100:
+        seen_ids = {str(a.get("id")) for a in payload.annonces if a.get("id")}
+        try:
+            live = sb.table("articles").select("sku,vinted_item_id").eq("vinted_account_id", vinted_account_id) \
+                .eq("platform", "Vinted").eq("status", "stock").not_.is_("vinted_item_id", "null").execute()
+            gone_skus = [r["sku"] for r in (live.data or []) if r["vinted_item_id"] not in seen_ids]
+            if gone_skus:
+                sb.table("articles").delete().in_("sku", gone_skus).execute()
+        except Exception as e:
+            print(f"[SYNC ERROR] reconciliation annonces supprimées: {e}")
             capture_error(e)
 
     # ── Ventes → articles "à expédier" puis "vendu" une fois expédié ─────────
