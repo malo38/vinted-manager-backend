@@ -908,11 +908,19 @@ def republish_now(payload: RepublishNowPayload, user_id: str = Depends(get_curre
     account_id = resolve_vinted_account_id(sb, user_id, vinted_account_id=payload.vinted_account_id)
     if not account_id:
         raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté.")
-    sb.table("vinted_republish_settings").upsert({
-        "vinted_account_id": account_id,
-        "user_id": user_id,
-        "priority_item_id": payload.vinted_item_id,
-    }, on_conflict="vinted_account_id").execute()
+    # Une erreur Postgrest ici (ex: colonne manquante — vécu le 2026-07-16,
+    # migration supabase_republish_priority.sql jamais exécutée) plantait la
+    # requête sans réponse HTTP propre, ce qui remontait côté navigateur comme
+    # un simple "Failed to fetch" impossible à diagnostiquer depuis le site.
+    try:
+        sb.table("vinted_republish_settings").upsert({
+            "vinted_account_id": account_id,
+            "user_id": user_id,
+            "priority_item_id": payload.vinted_item_id,
+        }, on_conflict="vinted_account_id").execute()
+    except Exception as e:
+        capture_error(e)
+        raise HTTPException(status_code=500, detail=f"Échec de la programmation : {e}")
     return {"ok": True}
 
 
