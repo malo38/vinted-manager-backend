@@ -153,25 +153,58 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
         if norm_name:
             # Pour une annonce ou un achat, un article déjà "vendu" est exclu
             # des candidats (on ne veut pas rouvrir un item déjà écoulé comme
-            # s'il était encore en stock). Pour une VENTE en revanche, exclure
-            # les "vendu" empêchait de reconnaître qu'une vente déjà traitée
-            # (mais sans lien enregistré, ex: articles antérieurs à la
-            # migration SKU) était la même que celle qu'on resynchronise —
-            # ça créait un doublon au lieu de la retrouver (signalé le
-            # 2026-07-15, juste après la mise en place de ce système).
-            query = sb.table("articles").select("sku,name") \
+            # s'il était encore en stock). Pour une VENTE en revanche, on les
+            # inclut aussi — mais en dernier recours seulement (voir tri
+            # ci-dessous) : les exclure totalement empêchait de reconnaître
+            # qu'une vente déjà traitée (mais sans lien enregistré, ex:
+            # articles antérieurs à la migration SKU) était la même que celle
+            # qu'on resynchronise, créant un doublon au lieu de la retrouver
+            # (signalé le 2026-07-15). Mais les inclure sans les mettre en
+            # dernier faisait l'inverse : avec plusieurs exemplaires identiques
+            # (ex: 5x le même article en stock, achat-revente en gros), la 2e
+            # vente d'un même nom se rattachait au premier exemplaire déjà
+            # vendu au lieu d'un des 4 encore en stock — silencieusement
+            # ignorée par le garde-fou "jamais régresser un vendu" plus loin
+            # (signalé le 2026-07-17).
+            query = sb.table("articles").select("sku,name,status") \
                 .eq("user_id", user_id).eq("vinted_account_id", vinted_account_id)
             if context != "order_sale":
                 query = query.neq("status", "vendu")
             candidates = query.execute()
-            for c in (candidates.data or []):
-                if (c.get("name") or "").strip().lower() == norm_name:
-                    sku = c["sku"]
-                    sb.table("vinted_links").upsert(
-                        {"sku": sku, "context": context, "vinted_id": vinted_id},
-                        on_conflict="context,vinted_id",
-                    ).execute()
-                    return sku
+            matches = [c for c in (candidates.data or []) if (c.get("name") or "").strip().lower() == norm_name]
+            # Pour une ANNONCE : un sku déjà lié à une autre annonce active
+            # (contexte "listing") est exclu des candidats — sinon 5 annonces
+            # identiques (même nom, id différents, ex: achat-revente en gros)
+            # fusionnaient toutes vers la même fiche dès la 1ère synchro, avant
+            # même toute vente, laissant les 4 autres exemplaires physiques
+            # invisibles pour toujours (signalé le 2026-07-17, juste après le
+            # même bug détecté côté ventes). Un sku déjà lié à CET id précis
+            # aurait déjà été trouvé par le lookup vinted_links plus haut, donc
+            # ne peut pas être exclu à tort ici.
+            if context == "listing" and matches:
+                linked = sb.table("vinted_links").select("sku").eq("context", "listing") \
+                    .in_("sku", [m["sku"] for m in matches]).execute()
+                claimed_skus = {r["sku"] for r in (linked.data or [])}
+                matches = [m for m in matches if m["sku"] not in claimed_skus]
+            # Exemplaire encore en stock en priorité ; un déjà vendu seulement
+            # si aucun autre candidat n'est disponible.
+            matches.sort(key=lambda c: 1 if c.get("status") == "vendu" else 0)
+            # Pour une VENTE : si le seul candidat restant est déjà vendu, ce
+            # n'est pas une resynchro de cette même vente (aucun exemplaire
+            # disponible à rattacher) — mieux vaut la mettre en file de
+            # réconciliation manuelle que de la rattacher à un article déjà
+            # écoulé et la voir ignorée en silence par le garde-fou "jamais
+            # régresser un vendu" plus loin (signalé le 2026-07-17 : 4 ventes
+            # sur 5 d'un même article en stock x5 disparaissaient ainsi).
+            if context == "order_sale" and matches and matches[0].get("status") == "vendu":
+                matches = []
+            if matches:
+                sku = matches[0]["sku"]
+                sb.table("vinted_links").upsert(
+                    {"sku": sku, "context": context, "vinted_id": vinted_id},
+                    on_conflict="context,vinted_id",
+                ).execute()
+                return sku
 
     if create_defaults is not None:
         new_sku = uuid.uuid4().hex[:8]
