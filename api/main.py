@@ -148,6 +148,7 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
     if link_res.data:
         return link_res.data[0]["sku"]
 
+    no_name_collision_at_all = True
     if name:
         norm_name = name.strip().lower()
         if norm_name:
@@ -172,6 +173,13 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
                 query = query.neq("status", "vendu")
             candidates = query.execute()
             matches = [c for c in (candidates.data or []) if (c.get("name") or "").strip().lower() == norm_name]
+            # Aucune fiche du même nom trouvée du tout, avant tout filtrage :
+            # pas d'ambiguïté possible, une vente dans ce cas peut être créée
+            # directement sans passer par la réconciliation manuelle (voir
+            # plus bas, create_defaults pour order_sale). Un nom déjà présent
+            # (même vendu) reste en revanche envoyé en réconciliation — cas où
+            # une vraie confusion entre exemplaires identiques est possible.
+            no_name_collision_at_all = not matches
             # Pour une ANNONCE : un sku déjà lié à une autre annonce active
             # (contexte "listing") est exclu des candidats — sinon 5 annonces
             # identiques (même nom, id différents, ex: achat-revente en gros)
@@ -206,7 +214,11 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
                 ).execute()
                 return sku
 
-    if create_defaults is not None:
+    # Pour une VENTE, ne créer automatiquement que si le nom n'entrait en
+    # collision avec RIEN du tout (aucune ambiguïté possible) — sinon un
+    # exemplaire déjà vendu du même nom part en réconciliation manuelle
+    # (voir plus haut) plutôt que de risquer de créer un doublon à tort.
+    if create_defaults is not None and (context != "order_sale" or no_name_collision_at_all):
         new_sku = uuid.uuid4().hex[:8]
         sb.table("articles").insert({**create_defaults, "sku": new_sku}).execute()
         sb.table("vinted_links").insert({"sku": new_sku, "context": context, "vinted_id": vinted_id}).execute()
@@ -450,7 +462,26 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
         if statut_code in FAILED_TRANSACTION_STATUSES:
             continue
         try:
-            sku = resolve_sku(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=str(v.get("titre") or ""))
+            name = str(v.get("titre") or "")[:255]
+            # create_defaults n'est utilisé par resolve_sku que si le nom ne
+            # collisionne avec RIEN du tout (aucun article existant du même
+            # nom, même vendu) — sinon la vente part quand même en
+            # réconciliation manuelle, voir resolve_sku.
+            sku = resolve_sku(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=name, create_defaults={
+                "user_id": user_id,
+                "vinted_account_id": vinted_account_id,
+                "name": name,
+                "vinted_item_id": vinted_id,
+                "sell_price": float(v.get("prix") or 0),
+                "platform": "Vinted",
+                "status": "vendu" if statut_code in COMPLETED_TRANSACTION_STATUSES else "expedition",
+                "sell_date": str(v.get("date_vente") or "")[:10] or None,
+                "photo_url": str(v.get("photo") or "") or None,
+                "vinted_shipping_status": str(v.get("statut") or "")[:255],
+                "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
+                "source": "Vinted",
+                "synced_at": today,
+            })
         except Exception as e:
             print(f"[SYNC ERROR] resolve_sku vente {vinted_id}: {e}")
             capture_error(e)
