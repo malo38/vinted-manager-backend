@@ -632,6 +632,26 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                     if r["transaction_status"] == "failed":
                         continue
                     try:
+                        # Filet de sécurité backend, indépendant de la version de
+                        # l'extension : Vinted liste parfois une vraie vente
+                        # aussi dans les achats (même titre, prix et date) —
+                        # signalé le 2026-07-19, un article vendu se voyait
+                        # attribuer un faux prix d'achat identique au prix de
+                        # vente, faisant apparaître un profit à 0€. Si un article
+                        # déjà vendu correspond exactement (nom + date + prix), on
+                        # se contente de lier cet id sans jamais toucher au
+                        # buy_price existant, plutôt que de risquer de l'écraser.
+                        phantom = sb.table("articles").select("sku").eq("user_id", user_id) \
+                            .eq("vinted_account_id", vinted_account_id).eq("status", "vendu") \
+                            .eq("name", r["title"][:255]).eq("sell_date", r["purchase_date"]) \
+                            .eq("sell_price", r["price"]).limit(1).execute()
+                        if phantom.data:
+                            sku = phantom.data[0]["sku"]
+                            sb.table("vinted_links").upsert(
+                                {"sku": sku, "context": "order_purchase", "vinted_id": r["id"]},
+                                on_conflict="context,vinted_id",
+                            ).execute()
+                            continue
                         resolve_sku(sb, user_id, vinted_account_id, "order_purchase", r["id"], name=r["title"], create_defaults={
                             "user_id": user_id,
                             "vinted_account_id": vinted_account_id,
