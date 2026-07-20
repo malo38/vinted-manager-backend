@@ -5,7 +5,10 @@ Reçoit les données envoyées par l'extension Chrome (ventes, annonces, message
 et les sauvegarde dans Supabase pour les afficher automatiquement dans
 Vinted Manager.
 
-Aucune donnée sensible (mot de passe) n'est jamais stockée.
+Aucun mot de passe Vinted/VintControl n'est jamais stocké. Exception opt-in :
+la fonctionnalité bêta "automatisation serveur" stocke un cookie de session
+Vinted (avec consentement explicite), verrouillé par RLS sans policy — voir
+vinted_session_credentials dans supabase_server_automation.sql.
 """
 
 import os
@@ -851,6 +854,7 @@ def automessage_config(vinted_user_id: str = "", vinted_account_id: str = "", us
         "daily_limit": int(settings.get("daily_limit") or 20),
         "batch_size": max(1, int(settings.get("batch_size") or 1)),
         "sent_today": sent_today,
+        "server_automation_enabled": bool(settings.get("server_automation_enabled")),
     }
 
 
@@ -916,6 +920,273 @@ def mark_messaged(payload: MarkMessagedPayload, user_id: str = Depends(get_curre
         "message": payload.message[:1000],
     }, on_conflict="id").execute()
     return {"ok": True}
+
+
+# ── AUTOMATISATION SERVEUR (bêta, opt-in) ───────────────────────────────
+# Permet à un utilisateur d'accepter que le backend rejoue sa session Vinted
+# pour continuer les messages aux favoris même ordinateur éteint. Le cookie
+# de session est une donnée aussi sensible qu'un mot de passe : jamais logué,
+# stocké uniquement dans vinted_session_credentials (RLS sans policy, voir
+# supabase_server_automation.sql — seule la service_role key y accède).
+
+class ServerAutomationCredentialsPayload(BaseModel):
+    session_cookie: str
+    anon_id: str = ""
+    csrf_token: str = ""
+    user_agent: str = ""
+    vinted_user_id: str = ""
+
+
+@app.post("/api/extension/server-automation-credentials")
+def save_server_automation_credentials(payload: ServerAutomationCredentialsPayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Reçoit le cookie de session Vinted capturé par l'extension, seulement
+    envoyé quand l'utilisateur a explicitement activé l'opt-in (voir
+    /api/settings/server-automation-optin). Efface tout état "invalidé"
+    précédent : un nouveau cookie reçu signifie une session fraîche.
+    """
+    sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id=payload.vinted_user_id)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté.")
+    sb.table("vinted_session_credentials").upsert({
+        "vinted_account_id": account_id,
+        "user_id": user_id,
+        "session_cookie": payload.session_cookie,
+        "anon_id": payload.anon_id,
+        "csrf_token": payload.csrf_token,
+        "user_agent": payload.user_agent,
+        "captured_at": datetime.utcnow().isoformat(),
+        "invalidated_at": None,
+        "last_error": None,
+    }, on_conflict="vinted_account_id").execute()
+    return {"ok": True}
+
+
+class ServerAutomationOptInPayload(BaseModel):
+    enabled: bool
+    vinted_account_id: str
+    consent_text: str = ""
+
+
+@app.post("/api/settings/server-automation-optin")
+def set_server_automation_optin(payload: ServerAutomationOptInPayload, user_id: str = Depends(get_current_user_id)):
+    """
+    Active/désactive l'automatisation serveur pour un compte Vinted précis.
+    À l'activation, enregistre le texte de consentement affiché à
+    l'utilisateur (traçabilité) et l'horodatage.
+    """
+    sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_account_id=payload.vinted_account_id)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Aucun compte Vinted connecté.")
+
+    existing = sb.table("vinted_automessage_settings").select("*").eq("vinted_account_id", account_id).limit(1).execute()
+    row = existing.data[0] if existing.data else {
+        "enabled": False, "template": "", "delay_min_sec": 60, "delay_max_sec": 180,
+        "daily_limit": 20, "batch_size": 1,
+    }
+    update = {
+        "user_id": user_id,
+        "vinted_account_id": account_id,
+        "enabled": row.get("enabled", False),
+        "template": row.get("template", ""),
+        "delay_min_sec": row.get("delay_min_sec", 60),
+        "delay_max_sec": row.get("delay_max_sec", 180),
+        "daily_limit": row.get("daily_limit", 20),
+        "batch_size": row.get("batch_size", 1),
+        "server_automation_enabled": payload.enabled,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if payload.enabled:
+        update["server_automation_consented_at"] = datetime.utcnow().isoformat()
+        update["server_automation_consent_text"] = payload.consent_text[:2000]
+    sb.table("vinted_automessage_settings").upsert(update, on_conflict="vinted_account_id").execute()
+    return {"ok": True}
+
+# ── Job planifié : rejoue runAutoMessageFavoris() côté serveur ──
+# Ne tourne que pour les comptes ayant explicitement activé l'opt-in (voir
+# set_server_automation_optin ci-dessus). Port direct de la logique
+# extension/background.js (runAutoMessageFavoris, ~ligne 563-720).
+
+import asyncio
+import re
+import random
+import requests
+
+def _record_sent_message(sb: Client, user_id: str, account_id: str, notif_id: str, recipient_login: str, message: str):
+    """Partagée entre mark_messaged() (extension) et le job serveur — même
+    upsert idempotent par id de notification Vinted."""
+    sb.table("vinted_sent_messages").upsert({
+        "id": notif_id,
+        "user_id": user_id,
+        "vinted_account_id": account_id,
+        "recipient_login": recipient_login[:100],
+        "message": message[:1000],
+    }, on_conflict="id").execute()
+
+
+def _invalidate_server_automation(sb: Client, account_id: str, error: str):
+    sb.table("vinted_session_credentials").update({
+        "invalidated_at": datetime.utcnow().isoformat(),
+        "last_error": error,
+    }).eq("vinted_account_id", account_id).execute()
+    sb.table("vinted_automessage_settings").update({
+        "server_automation_enabled": False,
+    }).eq("vinted_account_id", account_id).execute()
+
+
+def _vinted_headers(creds: dict, csrf: str) -> dict:
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "x-csrf-token": csrf,
+        "Cookie": creds["session_cookie"],
+        "User-Agent": creds.get("user_agent") or "Mozilla/5.0",
+    }
+    if creds.get("anon_id"):
+        headers["x-anon-id"] = creds["anon_id"]
+    return headers
+
+
+def _fetch_fresh_csrf(session_cookie: str, user_agent: str) -> str | None:
+    r = requests.get(
+        "https://www.vinted.fr/items/new",
+        headers={"Cookie": session_cookie, "User-Agent": user_agent or "Mozilla/5.0"},
+        timeout=15,
+    )
+    if r.status_code in (401, 403):
+        raise PermissionError(str(r.status_code))
+    m = re.search(r'CSRF_TOKEN\\*"\s*:\s*\\*"([a-f0-9-]{20,})', r.text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+_FAVORITE_LINK_RE = re.compile(r"\?offering_id=|messaging\?item_id=\d+&user_id=\d+|want_it\?receiver_id=\d+&item_id=\d+")
+
+
+def _find_one_eligible_sync(headers: dict, exclude_notif_ids: set) -> tuple[dict | None, list]:
+    debug_trace = []
+    r = requests.get(
+        "https://api.vinted.fr/inbox-notifications/v1/notifications?page=1&per_page=20",
+        headers=headers, timeout=15,
+    )
+    if r.status_code in (401, 403):
+        raise PermissionError(str(r.status_code))
+    if not r.ok:
+        return None, [{"skip": f"HTTP {r.status_code}"}]
+    notifications = r.json().get("notifications", [])
+    favorite_notifs = [n for n in notifications if n.get("link") and _FAVORITE_LINK_RE.search(n["link"])]
+
+    for n in favorite_notifs:
+        notif_id = str(n.get("id"))
+        if notif_id in exclude_notif_ids:
+            continue
+        link = n["link"]
+        messaging_match = re.search(r"messaging\?item_id=(\d+)&user_id=(\d+)", link)
+        want_it_match = re.search(r"want_it\?receiver_id=(\d+)&item_id=(\d+)", link)
+        offering_match = re.search(r"offering_id=(\d+)", link)
+        item_id = messaging_match.group(1) if messaging_match else (want_it_match.group(2) if want_it_match else str(n.get("subject_id")))
+        opposite_user_id = (
+            messaging_match.group(2) if messaging_match
+            else want_it_match.group(1) if want_it_match
+            else offering_match.group(1) if offering_match else None
+        )
+        if not opposite_user_id:
+            debug_trace.append({"id": notif_id, "skip": "no_user_id_resolved"})
+            continue
+        conv_r = requests.post(
+            "https://www.vinted.fr/api/v2/conversations",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"initiator": "seller_enters_notification", "item_id": item_id, "opposite_user_id": opposite_user_id},
+            timeout=15,
+        )
+        if conv_r.status_code in (401, 403):
+            raise PermissionError(str(conv_r.status_code))
+        if not conv_r.ok:
+            debug_trace.append({"id": notif_id, "skip": f"HTTP {conv_r.status_code}"})
+            continue
+        conv = conv_r.json().get("conversation")
+        if not conv or conv.get("messages"):
+            debug_trace.append({"id": notif_id, "skip": "no_conversation_or_already_replied"})
+            continue
+        name_match = re.match(r"^(.+?)\s+a marqué", n.get("body") or "")
+        return {
+            "conversation_id": str(conv["id"]), "notif_id": notif_id,
+            "name": (conv.get("opposite_user") or {}).get("login") or (name_match.group(1) if name_match else ""),
+        }, debug_trace
+    return None, debug_trace
+
+
+async def run_server_automation_cycle():
+    sb = get_supabase()
+    accounts = sb.table("vinted_automessage_settings").select("*") \
+        .eq("enabled", True).eq("server_automation_enabled", True).execute()
+
+    for settings in (accounts.data or []):
+        account_id = settings["vinted_account_id"]
+        user_id = settings["user_id"]
+        creds_res = sb.table("vinted_session_credentials").select("*").eq("vinted_account_id", account_id).limit(1).execute()
+        if not creds_res.data or creds_res.data[0].get("invalidated_at"):
+            continue
+        creds = creds_res.data[0]
+
+        today = date.today().isoformat()
+        sent_res = sb.table("vinted_sent_messages").select("id", count="exact") \
+            .eq("vinted_account_id", account_id).gte("sent_at", f"{today}T00:00:00").execute()
+        sent_today = sent_res.count or 0
+        daily_limit = int(settings.get("daily_limit") or 20)
+        if sent_today >= daily_limit:
+            continue
+        batch_size = max(1, min(int(settings.get("batch_size") or 1), daily_limit - sent_today))
+
+        try:
+            csrf = await asyncio.to_thread(_fetch_fresh_csrf, creds["session_cookie"], creds.get("user_agent") or "")
+            if not csrf:
+                continue
+            headers = _vinted_headers(creds, csrf)
+
+            exclude_notif_ids = set()
+            for i in range(batch_size):
+                if i > 0:
+                    await asyncio.sleep(random.uniform(
+                        int(settings.get("delay_min_sec") or 60), int(settings.get("delay_max_sec") or 180)
+                    ))
+                found, _debug = await asyncio.to_thread(_find_one_eligible_sync, headers, exclude_notif_ids)
+                if not found:
+                    break
+                exclude_notif_ids.add(found["notif_id"])
+                message = (settings.get("template") or "").replace("{item}", found["name"] or "cet article")
+                if not message.strip():
+                    break
+                reply_r = await asyncio.to_thread(
+                    requests.post,
+                    f"https://www.vinted.fr/api/v2/conversations/{found['conversation_id']}/replies",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"reply": {"body": message, "photo_temp_uuids": None}},
+                    timeout=15,
+                )
+                if reply_r.status_code in (401, 403):
+                    raise PermissionError(str(reply_r.status_code))
+                if reply_r.ok:
+                    _record_sent_message(sb, user_id, account_id, found["notif_id"], found["name"], message)
+
+            sb.table("vinted_session_credentials").update({"last_used_at": datetime.utcnow().isoformat()}).eq("vinted_account_id", account_id).execute()
+        except PermissionError as exc:
+            _invalidate_server_automation(sb, account_id, str(exc))
+        except Exception as exc:
+            capture_error(exc)
+
+
+@app.on_event("startup")
+async def start_server_automation_worker():
+    async def loop():
+        while True:
+            try:
+                await run_server_automation_cycle()
+            except Exception as exc:
+                capture_error(exc)
+            await asyncio.sleep(300)
+    asyncio.create_task(loop())
 
 
 @app.get("/api/extension/sent-messages")
