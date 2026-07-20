@@ -963,6 +963,31 @@ def save_server_automation_credentials(payload: ServerAutomationCredentialsPaylo
     return {"ok": True}
 
 
+@app.get("/api/extension/server-automation-status")
+def get_server_automation_status(vinted_user_id: str = "", vinted_account_id: str = "", user_id: str = Depends(get_current_user_id)):
+    """
+    Métadonnées non-sensibles sur l'état de l'automatisation serveur (jamais
+    le cookie/csrf lui-même) — pour diagnostiquer sans exposer de credentials.
+    """
+    sb = get_supabase()
+    account_id = resolve_vinted_account_id(sb, user_id, vinted_user_id, vinted_account_id)
+    if not account_id:
+        return {"has_credentials": False}
+    res = sb.table("vinted_session_credentials").select(
+        "captured_at,last_used_at,last_error,invalidated_at"
+    ).eq("vinted_account_id", account_id).limit(1).execute()
+    if not res.data:
+        return {"has_credentials": False}
+    row = res.data[0]
+    return {
+        "has_credentials": True,
+        "captured_at": row.get("captured_at"),
+        "last_used_at": row.get("last_used_at"),
+        "last_error": row.get("last_error"),
+        "invalidated_at": row.get("invalidated_at"),
+    }
+
+
 class ServerAutomationOptInPayload(BaseModel):
     enabled: bool
     vinted_account_id: str
