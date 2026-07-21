@@ -1146,14 +1146,17 @@ async def run_server_automation_cycle():
     sb = get_supabase()
     accounts = sb.table("vinted_automessage_settings").select("*") \
         .eq("enabled", True).eq("server_automation_enabled", True).execute()
+    print(f"[server_automation] cycle start, {len(accounts.data or [])} compte(s) éligible(s)")
 
     for settings in (accounts.data or []):
         account_id = settings["vinted_account_id"]
         user_id = settings["user_id"]
         creds_res = sb.table("vinted_session_credentials").select("*").eq("vinted_account_id", account_id).limit(1).execute()
         if not creds_res.data or creds_res.data[0].get("invalidated_at"):
+            print(f"[server_automation] {account_id}: pas de credentials valides, skip")
             continue
         creds = creds_res.data[0]
+        print(f"[server_automation] {account_id}: credentials trouvés, cookie non-vide={bool(creds.get('session_cookie'))}")
 
         today = date.today().isoformat()
         sent_res = sb.table("vinted_sent_messages").select("id", count="exact") \
@@ -1166,6 +1169,7 @@ async def run_server_automation_cycle():
 
         try:
             csrf = await asyncio.to_thread(_fetch_fresh_csrf, creds["session_cookie"], creds.get("user_agent") or "")
+            print(f"[server_automation] {account_id}: csrf trouvé={bool(csrf)}")
             if not csrf:
                 continue
             headers = _vinted_headers(creds, csrf)
@@ -1197,18 +1201,22 @@ async def run_server_automation_cycle():
 
             sb.table("vinted_session_credentials").update({"last_used_at": datetime.utcnow().isoformat()}).eq("vinted_account_id", account_id).execute()
         except PermissionError as exc:
+            print(f"[server_automation] {account_id}: session invalidée ({exc})")
             _invalidate_server_automation(sb, account_id, str(exc))
         except Exception as exc:
+            print(f"[server_automation] {account_id}: exception {type(exc).__name__}: {exc}")
             capture_error(exc)
 
 
 @app.on_event("startup")
 async def start_server_automation_worker():
+    print("[server_automation] worker démarré")
     async def loop():
         while True:
             try:
                 await run_server_automation_cycle()
             except Exception as exc:
+                print(f"[server_automation] exception au niveau boucle: {type(exc).__name__}: {exc}")
                 capture_error(exc)
             await asyncio.sleep(300)
     asyncio.create_task(loop())
