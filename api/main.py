@@ -15,7 +15,7 @@ import os
 import uuid
 from typing import Optional
 from datetime import date, datetime, timedelta
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -1554,5 +1554,110 @@ def market_price(query: str, user_id: str = Depends(get_current_user_id)):
         "min": prices[0],
         "max": prices[-1],
     }
+
+
+# ============================================================
+# ROUTE: Proxy image (détection de doublons par photo)
+# ============================================================
+
+from urllib.parse import urlparse
+
+_IMAGE_PROXY_ALLOWED_SUFFIXES = (".vinted.net", ".vinted.fr", ".vinted.com")
+
+
+@app.get("/api/image-proxy")
+def image_proxy(url: str, user_id: str = Depends(get_current_user_id)):
+    """
+    Rejoue une photo d'article (CDN Vinted ou stockage Supabase) avec un
+    Access-Control-Allow-Origin permissif : les CDN d'origine n'en envoient
+    pas, ce qui "taint" le canvas côté navigateur et empêche d'en lire les
+    pixels. Nécessaire pour le hash perceptuel du détecteur de doublons par
+    photo (js/app.js, computePhotoHash côté site). Liste blanche stricte de
+    domaines pour ne pas devenir un proxy HTTP ouvert (SSRF).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="URL invalide.")
+    host = (parsed.hostname or "").lower()
+    supabase_host = urlparse(SUPABASE_URL).hostname if SUPABASE_URL else None
+    allowed = host.endswith(_IMAGE_PROXY_ALLOWED_SUFFIXES) or (supabase_host and host == supabase_host)
+    if not allowed:
+        raise HTTPException(status_code=400, detail="Domaine non autorisé.")
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Impossible de récupérer l'image.")
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ============================================================
+# ROUTE: Notifications Web Push (nouvelle vente / nouveau favori)
+# ============================================================
+# Limite connue, pas un bug : la détection (nouvelle vente, nouveau favori)
+# est faite par l'extension Chrome pendant sa synchro périodique — donc SUR
+# L'ORDINATEUR de l'utilisateur. Si l'ordinateur est éteint, l'extension ne
+# tourne pas et rien n'est détecté : la notif arrive au prochain rallumage/
+# synchro, pas en temps réel. Un vrai temps réel 24/7 demanderait un
+# navigateur headless tournant en continu côté serveur (voir la même
+# limite documentée pour l'automatisation serveur des messages favoris,
+# supabase_server_automation.sql) — hors scope ici, accepté en connaissance
+# de cause avec l'utilisateur le 2026-07-21.
+#
+# Abonnement (subscribe/unsubscribe) géré directement par le site via
+# supabase-js (RLS auth.uid()=user_id, voir supabase_push_subscriptions.sql) :
+# seul l'ENVOI a besoin de la clé privée VAPID, jamais exposée au navigateur.
+
+from pywebpush import webpush, WebPushException
+import json as json_lib
+
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIMS_EMAIL = os.getenv("VAPID_CLAIMS_EMAIL", "mailto:contact@vintcontrol.com")
+
+
+def send_push_to_user(sb: Client, user_id: str, title: str, body: str, url: str = "/") -> None:
+    if not VAPID_PRIVATE_KEY:
+        return
+    subs = sb.table("push_subscriptions").select("*").eq("user_id", user_id).execute()
+    for sub in (subs.data or []):
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]},
+                },
+                data=json_lib.dumps({"title": title, "body": body, "url": url}),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_CLAIMS_EMAIL},
+                timeout=10,
+            )
+        except WebPushException as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (404, 410):
+                # Abonnement expiré/révoqué côté navigateur (désinstallation,
+                # nettoyage des données...) : on le retire pour ne pas réessayer
+                # indéfiniment dans le vide.
+                sb.table("push_subscriptions").delete().eq("id", sub["id"]).execute()
+        except Exception as e:
+            capture_error(e)
+
+
+class PushNotifyPayload(BaseModel):
+    title: str
+    body: str
+    url: str = "/"
+
+
+@app.post("/api/push/notify")
+def push_notify(payload: PushNotifyPayload, user_id: str = Depends(get_current_user_id)):
+    """Appelé par l'extension Chrome quand elle détecte une nouvelle vente ou
+    un nouveau favori pendant sa synchro (voir notifyNewSalesAndFavorites
+    dans background.js)."""
+    send_push_to_user(get_supabase(), user_id, payload.title, payload.body, payload.url)
+    return {"ok": True}
 
 
