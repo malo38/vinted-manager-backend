@@ -1080,6 +1080,7 @@ def _fetch_fresh_csrf(session_cookie: str, user_agent: str) -> str | None:
         headers={"Cookie": session_cookie, "User-Agent": user_agent or "Mozilla/5.0"},
         timeout=15,
     )
+    print(f"[server_automation] csrf fetch: status={r.status_code} url_final={r.url} taille_reponse={len(r.text)} debut={r.text[:150]!r}")
     if r.status_code in (401, 403):
         raise PermissionError(str(r.status_code))
     m = re.search(r'CSRF_TOKEN\\*"\s*:\s*\\*"([a-f0-9-]{20,})', r.text, re.IGNORECASE)
