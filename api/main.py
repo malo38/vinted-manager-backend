@@ -12,6 +12,7 @@ vinted_session_credentials dans supabase_server_automation.sql.
 """
 
 import os
+import re
 import uuid
 from typing import Optional
 from datetime import date, datetime, timedelta
@@ -127,6 +128,16 @@ def dedupe_by_key(rows: list, key: str) -> list:
     return list(seen.values())
 
 
+def strip_sku_tag(title: str) -> str:
+    """Retire un tag "#SKU" en fin de titre Vinted (voir resolve_sku, convention
+    recommandée dans le formulaire d'ajout d'article) avant d'enregistrer le nom
+    affiché dans VintControl — sinon le hashtag technique polluerait chaque
+    fiche. Utilisé aussi pour normaliser les DEUX côtés du rapprochement par nom
+    (titre Vinted entrant vs nom déjà stocké), qui doit rester insensible à la
+    présence ou non du tag de part et d'autre."""
+    return re.sub(r"\s*#[A-Za-z0-9]{4,20}\b\s*$", "", title or "").strip()
+
+
 def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, create_defaults=None):
     """
     Traduit un id Vinted (annonce / commande de vente / commande d'achat) en
@@ -151,9 +162,30 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
     if link_res.data:
         return link_res.data[0]["sku"]
 
+    # Priorité au SKU explicite dans le titre Vinted ("... #ab12cd34") : un
+    # utilisateur qui suit cette convention (recommandée dans l'app, voir le
+    # formulaire d'ajout d'article) obtient un rattachement exact et fiable à
+    # 100%, plutôt que le rapprochement approximatif par nom+prix+date
+    # ci-dessous — la source même des bugs de rattachement/"Lot N articles"
+    # mal reliés (signalé le 2026-07-22). Le sku doit exister pour CE compte
+    # pour être accepté (sinon un hashtag qui ressemble par hasard à un sku
+    # pourrait rattacher à tort le mauvais article).
+    if name:
+        m = re.search(r"#([A-Za-z0-9]{4,20})\b", name)
+        if m:
+            candidate_sku = m.group(1)
+            exists = sb.table("articles").select("sku").eq("user_id", user_id) \
+                .eq("vinted_account_id", vinted_account_id).eq("sku", candidate_sku).limit(1).execute()
+            if exists.data:
+                sb.table("vinted_links").upsert(
+                    {"sku": candidate_sku, "context": context, "vinted_id": vinted_id},
+                    on_conflict="context,vinted_id",
+                ).execute()
+                return candidate_sku
+
     no_name_collision_at_all = True
     if name:
-        norm_name = name.strip().lower()
+        norm_name = strip_sku_tag(name).lower()
         if norm_name:
             # Pour une annonce ou un achat, un article déjà "vendu" est exclu
             # des candidats (on ne veut pas rouvrir un item déjà écoulé comme
@@ -175,7 +207,7 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
             if context != "order_sale":
                 query = query.neq("status", "vendu")
             candidates = query.execute()
-            matches = [c for c in (candidates.data or []) if (c.get("name") or "").strip().lower() == norm_name]
+            matches = [c for c in (candidates.data or []) if strip_sku_tag(c.get("name") or "").lower() == norm_name]
             # Aucune fiche du même nom trouvée du tout, avant tout filtrage :
             # pas d'ambiguïté possible, une vente dans ce cas peut être créée
             # directement sans passer par la réconciliation manuelle (voir
@@ -356,7 +388,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 resolve_sku(sb, user_id, vinted_account_id, "listing", vinted_id, name=name, create_defaults={
                     "user_id": user_id,
                     "vinted_account_id": vinted_account_id,
-                    "name": name,
+                    "name": strip_sku_tag(name),
                     "sell_price": float(a.get("prix") or 0),
                     "platform": "Vinted",
                     "status": "stock",
@@ -473,7 +505,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             sku = resolve_sku(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=name, create_defaults={
                 "user_id": user_id,
                 "vinted_account_id": vinted_account_id,
-                "name": name,
+                "name": strip_sku_tag(name),
                 "vinted_item_id": vinted_id,
                 "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
@@ -637,7 +669,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 try:
                     phantom = sb.table("articles").select("sku").eq("user_id", user_id) \
                         .eq("vinted_account_id", vinted_account_id).eq("status", "vendu") \
-                        .eq("name", r["title"][:255]).eq("sell_date", r["purchase_date"]) \
+                        .eq("name", strip_sku_tag(r["title"][:255])).eq("sell_date", r["purchase_date"]) \
                         .eq("sell_price", r["price"]).limit(1).execute()
                 except Exception as e:
                     print(f"[SYNC ERROR] check phantom achat {r['id']}: {e}")
@@ -680,7 +712,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                         resolve_sku(sb, user_id, vinted_account_id, "order_purchase", r["id"], name=r["title"], create_defaults={
                             "user_id": user_id,
                             "vinted_account_id": vinted_account_id,
-                            "name": r["title"][:255],
+                            "name": strip_sku_tag(r["title"][:255]),
                             "buy_price": r["price"],
                             "buy_date": r["purchase_date"],
                             "platform": "Vinted",
