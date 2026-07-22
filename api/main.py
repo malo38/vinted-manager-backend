@@ -616,45 +616,67 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             existing = sb.table("vinted_purchases").select("id").eq("user_id", user_id) \
                 .eq("vinted_account_id", vinted_account_id).in_("id", [r["id"] for r in achat_rows]).execute()
             existing_ids = {row["id"] for row in (existing.data or [])}
-            new_rows = [r for r in achat_rows if r["id"] not in existing_ids]
 
-            sb.table("vinted_purchases").upsert(achat_rows, on_conflict="id").execute()
-            purchases_upserted += len(achat_rows)
+            # Filet anti "phantom achat" : Vinted liste parfois une vraie vente
+            # aussi dans les achats (même titre, prix et date) — surtout pour un
+            # gros catalogue où l'extension n'a pas encore fini de résoudre le
+            # current_user_side de chaque conversation (voir resolveOrderSides,
+            # plafonné par cycle côté extension) et retombe sur une heuristique
+            # non fiable. Avant, on se contentait de lier le sku sans upserter la
+            # ligne dans vinted_purchases — mais l'upsert avait déjà lieu AVANT ce
+            # test, donc la vente polluait quand même l'onglet Achats et les stats
+            # "achats du mois" (signalé le 2026-07-22). Désormais : toute ligne
+            # correspondant exactement à un article déjà "vendu" est exclue de
+            # l'upsert, et supprimée si elle traînait déjà d'une synchro précédente.
+            real_rows = []
+            phantom_ids = []
+            for r in achat_rows:
+                if r["transaction_status"] == "failed":
+                    real_rows.append(r)
+                    continue
+                try:
+                    phantom = sb.table("articles").select("sku").eq("user_id", user_id) \
+                        .eq("vinted_account_id", vinted_account_id).eq("status", "vendu") \
+                        .eq("name", r["title"][:255]).eq("sell_date", r["purchase_date"]) \
+                        .eq("sell_price", r["price"]).limit(1).execute()
+                except Exception as e:
+                    print(f"[SYNC ERROR] check phantom achat {r['id']}: {e}")
+                    capture_error(e)
+                    real_rows.append(r)
+                    continue
+                if phantom.data:
+                    phantom_ids.append(r["id"])
+                    try:
+                        sb.table("vinted_links").upsert(
+                            {"sku": phantom.data[0]["sku"], "context": "order_purchase", "vinted_id": r["id"]},
+                            on_conflict="context,vinted_id",
+                        ).execute()
+                    except Exception as e:
+                        print(f"[SYNC ERROR] link phantom achat {r['id']}: {e}")
+                        capture_error(e)
+                else:
+                    real_rows.append(r)
+
+            if phantom_ids:
+                sb.table("vinted_purchases").delete().eq("user_id", user_id) \
+                    .eq("vinted_account_id", vinted_account_id).in_("id", phantom_ids).execute()
+
+            if real_rows:
+                sb.table("vinted_purchases").upsert(real_rows, on_conflict="id").execute()
+                purchases_upserted += len(real_rows)
 
             # Conversion auto en stock (étape "à laver") : uniquement les tout
-            # nouveaux achats, pour ne pas transformer rétroactivement tout
-            # l'historique en stock au moment de la mise en prod de cette
-            # fonctionnalité (voir supabase_purchase_stock_link.sql). Un achat déjà
-            # remboursé/annulé ("failed") n'est jamais arrivé : pas d'article créé.
-            # resolve_sku (contexte "order_purchase") enregistre le lien id
-            # d'achat ↔ sku : si ce même article réapparaît plus tard sous un
-            # id d'annonce ou de vente Vinted différent, le rapprochement par
-            # nom (voir resolve_sku) pourra encore le retrouver.
+            # nouveaux achats (réels, non-phantom), pour ne pas transformer
+            # rétroactivement tout l'historique en stock au moment de la mise en
+            # prod de cette fonctionnalité (voir supabase_purchase_stock_link.sql).
+            # Un achat déjà remboursé/annulé ("failed") n'est jamais arrivé : pas
+            # d'article créé.
+            new_rows = [r for r in real_rows if r["id"] not in existing_ids]
             if new_rows:
                 for r in new_rows:
                     if r["transaction_status"] == "failed":
                         continue
                     try:
-                        # Filet de sécurité backend, indépendant de la version de
-                        # l'extension : Vinted liste parfois une vraie vente
-                        # aussi dans les achats (même titre, prix et date) —
-                        # signalé le 2026-07-19, un article vendu se voyait
-                        # attribuer un faux prix d'achat identique au prix de
-                        # vente, faisant apparaître un profit à 0€. Si un article
-                        # déjà vendu correspond exactement (nom + date + prix), on
-                        # se contente de lier cet id sans jamais toucher au
-                        # buy_price existant, plutôt que de risquer de l'écraser.
-                        phantom = sb.table("articles").select("sku").eq("user_id", user_id) \
-                            .eq("vinted_account_id", vinted_account_id).eq("status", "vendu") \
-                            .eq("name", r["title"][:255]).eq("sell_date", r["purchase_date"]) \
-                            .eq("sell_price", r["price"]).limit(1).execute()
-                        if phantom.data:
-                            sku = phantom.data[0]["sku"]
-                            sb.table("vinted_links").upsert(
-                                {"sku": sku, "context": "order_purchase", "vinted_id": r["id"]},
-                                on_conflict="context,vinted_id",
-                            ).execute()
-                            continue
                         resolve_sku(sb, user_id, vinted_account_id, "order_purchase", r["id"], name=r["title"], create_defaults={
                             "user_id": user_id,
                             "vinted_account_id": vinted_account_id,
