@@ -18,7 +18,7 @@
 -- Copiez-collez dans Supabase SQL Editor
 -- ============================================================
 
-ALTER TABLE vinted_purchases ADD COLUMN IF NOT EXISTS dispute_status TEXT; -- null | 'litige' | 'rembourse' | 'compense'
+ALTER TABLE vinted_purchases ADD COLUMN IF NOT EXISTS dispute_status TEXT; -- null | 'litige' | 'rembourse' | 'compense' | 'perdu'
 ALTER TABLE vinted_purchases ADD COLUMN IF NOT EXISTS dispute_amount NUMERIC;
 ALTER TABLE vinted_purchases ADD COLUMN IF NOT EXISTS dispute_note TEXT;
 ALTER TABLE vinted_purchases ADD COLUMN IF NOT EXISTS dispute_updated_at TIMESTAMPTZ;
