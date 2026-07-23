@@ -256,7 +256,22 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
     if create_defaults is not None and (context != "order_sale" or no_name_collision_at_all):
         new_sku = uuid.uuid4().hex[:8]
         sb.table("articles").insert({**create_defaults, "sku": new_sku}).execute()
-        sb.table("vinted_links").insert({"sku": new_sku, "context": context, "vinted_id": vinted_id}).execute()
+        try:
+            sb.table("vinted_links").insert({"sku": new_sku, "context": context, "vinted_id": vinted_id}).execute()
+        except Exception as e:
+            # Doublon observé en prod le 2026-07-23 (Sentry), corrélé à des
+            # coupures de connexion (RemoteProtocolError) sur ce même
+            # endpoint : la requête réussit côté serveur mais sa réponse se
+            # perd, l'appelant (extension) rejoue alors la même synchro. Le
+            # lien créé par le premier essai existe déjà dans ce cas — on le
+            # relit plutôt que de faire échouer toute la synchro pour un
+            # article qui, en réalité, a déjà été correctement créé.
+            if "duplicate key" not in str(e).lower():
+                raise
+            existing = sb.table("vinted_links").select("sku").eq("context", context).eq("vinted_id", vinted_id).execute()
+            if existing.data:
+                return existing.data[0]["sku"]
+            raise
         return new_sku
 
     return None
