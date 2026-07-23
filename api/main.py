@@ -179,7 +179,7 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
             if exists.data:
                 sb.table("vinted_links").upsert(
                     {"sku": candidate_sku, "context": context, "vinted_id": vinted_id},
-                    on_conflict="context,vinted_id",
+                    on_conflict="context,vinted_id,sku",
                 ).execute()
                 return candidate_sku
 
@@ -245,7 +245,7 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
                 sku = matches[0]["sku"]
                 sb.table("vinted_links").upsert(
                     {"sku": sku, "context": context, "vinted_id": vinted_id},
-                    on_conflict="context,vinted_id",
+                    on_conflict="context,vinted_id,sku",
                 ).execute()
                 return sku
 
@@ -260,6 +260,74 @@ def resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=None, c
         return new_sku
 
     return None
+
+
+# Marqueur multi-SKU pour une annonce-lot ("SKU: #A1 #B2 #C3", convention
+# reprise de Vinteer) — distinct du #SKU simple en fin de titre (resolve_sku
+# ci-dessus). Une seule annonce/vente Vinted peut ainsi regrouper plusieurs
+# articles physiques, chacun avec son propre coût d'achat et sa propre part
+# du prix de vente, au lieu d'une seule fiche fourre-tout "Lot N articles"
+# (signalé le 2026-07-23).
+_LOT_SKU_MARKER_RE = re.compile(r"sku\s*:\s*((?:#[A-Za-z0-9]{4,20}\s*)+)", re.IGNORECASE)
+
+
+def extract_lot_skus(text):
+    """Renvoie la liste des SKU trouvés après un marqueur "SKU:" dans le
+    texte (titre ou description) — vide si aucun marqueur, un seul élément
+    si un seul SKU y figure (pas vraiment un lot dans ce cas)."""
+    if not text:
+        return []
+    m = _LOT_SKU_MARKER_RE.search(text)
+    if not m:
+        return []
+    return re.findall(r"#([A-Za-z0-9]{4,20})", m.group(1))
+
+
+def split_lot_price(total, weights):
+    """Répartit `total` entre plusieurs pièces au prorata de `weights` (le
+    prix d'achat de chacune), à parts égales si tous les poids sont à 0. Le
+    dernier montant absorbe l'écart d'arrondi pour que la somme retombe
+    exactement sur le total réel (pas de centime perdu ou en trop)."""
+    n = len(weights)
+    total_weight = sum(weights)
+    shares = [(w / total_weight) if total_weight > 0 else (1 / n) for w in weights]
+    prices = [round(total * s, 2) for s in shares[:-1]]
+    prices.append(round(total - sum(prices), 2))
+    return prices
+
+
+def resolve_sku_or_lot(sb, user_id, vinted_account_id, context, vinted_id, name=None, create_defaults=None):
+    """
+    Comme resolve_sku, mais détecte d'abord un marqueur multi-SKU ("SKU: #A1
+    #B2 #C3") pour une annonce-lot. Renvoie {"type":"single","sku":...} dans
+    le cas normal, ou {"type":"lot","skus":[...]} si au moins 2 des SKU du
+    marqueur existent déjà parmi les articles du compte (sinon, un seul SKU
+    valide retombe sur le comportement normal — pas vraiment un lot).
+    """
+    if not vinted_id:
+        return None
+    lot_candidates = extract_lot_skus(name)
+    if len(lot_candidates) >= 2:
+        # Déjà décomposé lors d'une synchro précédente ? Le lien est alors
+        # déjà en place pour cet id précis (plusieurs lignes désormais
+        # possibles depuis supabase_multi_sku_lots.sql).
+        existing_links = sb.table("vinted_links").select("sku").eq("context", context).eq("vinted_id", vinted_id).execute()
+        if existing_links.data and len(existing_links.data) >= 2:
+            return {"type": "lot", "skus": [r["sku"] for r in existing_links.data]}
+        existing_articles = sb.table("articles").select("sku").eq("user_id", user_id) \
+            .eq("vinted_account_id", vinted_account_id).in_("sku", lot_candidates).execute()
+        valid_skus = [r["sku"] for r in (existing_articles.data or [])]
+        if len(valid_skus) >= 2:
+            for sku in valid_skus:
+                sb.table("vinted_links").upsert(
+                    {"sku": sku, "context": context, "vinted_id": vinted_id},
+                    on_conflict="context,vinted_id,sku",
+                ).execute()
+            return {"type": "lot", "skus": valid_skus}
+    sku = resolve_sku(sb, user_id, vinted_account_id, context, vinted_id, name=name, create_defaults=create_defaults)
+    if sku is None:
+        return None
+    return {"type": "single", "sku": sku}
 
 
 def resolve_vinted_account_id(sb: Client, user_id: str, vinted_user_id: str = "", vinted_account_id: str = "") -> str | None:
@@ -498,11 +566,12 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             continue
         try:
             name = str(v.get("titre") or "")[:255]
-            # create_defaults n'est utilisé par resolve_sku que si le nom ne
-            # collisionne avec RIEN du tout (aucun article existant du même
-            # nom, même vendu) — sinon la vente part quand même en
-            # réconciliation manuelle, voir resolve_sku.
-            sku = resolve_sku(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=name, create_defaults={
+            # create_defaults n'est utilisé que si le nom ne collisionne avec
+            # RIEN du tout (aucun article existant du même nom, même vendu)
+            # — sinon la vente part quand même en réconciliation manuelle,
+            # voir resolve_sku. resolve_sku_or_lot détecte en plus un
+            # marqueur multi-SKU ("SKU: #A1 #B2") pour une annonce-lot.
+            result = resolve_sku_or_lot(sb, user_id, vinted_account_id, "order_sale", vinted_id, name=name, create_defaults={
                 "user_id": user_id,
                 "vinted_account_id": vinted_account_id,
                 "name": strip_sku_tag(name),
@@ -521,19 +590,24 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
             print(f"[SYNC ERROR] resolve_sku vente {vinted_id}: {e}")
             capture_error(e)
             continue
-        if sku:
-            vente_links[vinted_id] = sku
+        if result:
+            vente_links[vinted_id] = result
+
+    all_ventes_skus = set()
+    for r in vente_links.values():
+        all_ventes_skus.update(r["skus"] if r["type"] == "lot" else [r["sku"]])
 
     vendu_skus_ventes = set()
-    if vente_links:
+    buy_price_by_sku = {}
+    if all_ventes_skus:
         try:
-            skus = list(set(vente_links.values()))
-            existing_ventes = sb.table("articles").select("sku,status,force_resync").in_("sku", skus).execute()
+            existing_ventes = sb.table("articles").select("sku,status,force_resync,buy_price").in_("sku", list(all_ventes_skus)).execute()
             for r in (existing_ventes.data or []):
                 if r["status"] == "vendu" and not r.get("force_resync"):
                     vendu_skus_ventes.add(r["sku"])
                 if r.get("force_resync"):
                     resync_ids.add(r["sku"])
+                buy_price_by_sku[r["sku"]] = float(r.get("buy_price") or 0)
         except Exception as e:
             print(f"[SYNC ERROR] check statut déjà vendu (ventes): {e}")
             capture_error(e)
@@ -546,10 +620,10 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
         statut_code = str(v.get("statut_code") or "").strip().lower()
         if statut_code in FAILED_TRANSACTION_STATUSES:
             continue
-        sku = vente_links.get(vinted_id)
+        result = vente_links.get(vinted_id)
         name = str(v.get("titre") or "")[:255]
         try:
-            if not sku:
+            if not result:
                 # Aucune correspondance fiable : file de réconciliation plutôt
                 # qu'une fiche de stock fantôme.
                 unmatched_rows.append({
@@ -564,16 +638,18 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                     "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
                 })
                 continue
-            if sku in vendu_skus_ventes:
+            skus_in_sale = result["skus"] if result["type"] == "lot" else [result["sku"]]
+            # Une seule pièce déjà vendue suffit à ignorer toute la vente
+            # (déjà traitée) — jamais régresser un article déjà "vendu".
+            if any(sku in vendu_skus_ventes for sku in skus_in_sale):
                 continue
             status = "vendu" if statut_code in COMPLETED_TRANSACTION_STATUSES else "expedition"
-            vente_rows.append({
-                "sku": sku,
+            total_price = float(v.get("prix") or 0)
+            base_row = {
                 "vinted_item_id": vinted_id,
                 "user_id": user_id,
                 "vinted_account_id": vinted_account_id,
                 "name": name,
-                "sell_price": float(v.get("prix") or 0),
                 "platform": "Vinted",
                 "status": status,
                 "sell_date": str(v.get("date_vente") or "")[:10] or None,
@@ -582,7 +658,17 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                 "synced_at": today,
                 "vinted_shipping_status": str(v.get("statut") or "")[:255],
                 "vinted_transaction_status": str(v.get("statut_code") or "")[:50],
-            })
+            }
+            if result["type"] == "lot":
+                # Répartition au prorata du prix d'achat de chaque pièce, à
+                # parts égales si aucun prix d'achat n'est renseigné (signalé
+                # le 2026-07-23, inspiré de Vinteer).
+                weights = [buy_price_by_sku.get(sku, 0) for sku in skus_in_sale]
+                prices = split_lot_price(total_price, weights)
+                for sku, piece_price in zip(skus_in_sale, prices):
+                    vente_rows.append({**base_row, "sku": sku, "sell_price": piece_price})
+            else:
+                vente_rows.append({**base_row, "sku": result["sku"], "sell_price": total_price})
         except Exception as e:
             print(f"[SYNC ERROR] vente {vinted_id} (construction): {e}")
             capture_error(e)
@@ -681,7 +767,7 @@ def extension_sync(payload: SyncPayload, user_id: str = Depends(get_current_user
                     try:
                         sb.table("vinted_links").upsert(
                             {"sku": phantom.data[0]["sku"], "context": "order_purchase", "vinted_id": r["id"]},
-                            on_conflict="context,vinted_id",
+                            on_conflict="context,vinted_id,sku",
                         ).execute()
                     except Exception as e:
                         print(f"[SYNC ERROR] link phantom achat {r['id']}: {e}")
@@ -1474,7 +1560,7 @@ def mark_republished(payload: MarkRepublishedPayload, user_id: str = Depends(get
         sb.table("vinted_links").delete().eq("context", "listing").eq("vinted_id", payload.old_vinted_item_id).execute()
         sb.table("vinted_links").upsert(
             {"sku": sku, "context": "listing", "vinted_id": payload.new_vinted_item_id},
-            on_conflict="context,vinted_id",
+            on_conflict="context,vinted_id,sku",
         ).execute()
 
     # Nettoyage d'un cas limite rare mais réel : si une synchro s'est
