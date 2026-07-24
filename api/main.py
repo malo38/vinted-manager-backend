@@ -1434,7 +1434,7 @@ def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user
     if enabled and republished_today < daily_limit:
         articles_query = (
             sb.table("articles")
-            .select("id,vinted_item_id")
+            .select("id,vinted_item_id,published_at,buy_date,created_at")
             .eq("user_id", user_id)
             .eq("status", "stock")
             .eq("platform", "Vinted")
@@ -1453,10 +1453,23 @@ def republish_config(vinted_user_id: str = "", vinted_account_id: str = "", user
         )
         cutoff = datetime.utcnow() - timedelta(days=frequency_days)
         last_republished = {r["article_id"]: r["last_republished_at"] for r in (log_res.data if log_res else [])}
+        eligible = []
         for a in candidates:
             last = last_republished.get(a["id"])
             if last is None or datetime.fromisoformat(last.replace("Z", "+00:00")).replace(tzinfo=None) < cutoff:
-                eligible_vinted_item_ids.append(a["vinted_item_id"])
+                # Date de référence pour l'ordre de traitement : la dernière
+                # republication si l'article en a déjà eu une, sinon sa date
+                # de mise en stock — la plus ancienne des deux passe en
+                # premier. Auparavant aucun tri n'était appliqué (ordre
+                # arbitraire renvoyé par Postgres) alors que le site affiche
+                # une file d'attente ordonnée : les deux ne correspondaient
+                # pas, l'ordre réellement traité par l'extension pouvait
+                # différer de ce qui était montré à l'utilisateur (signalé
+                # le 2026-07-23).
+                ref_date = last or a.get("published_at") or a.get("buy_date") or a.get("created_at") or ""
+                eligible.append((ref_date, a["vinted_item_id"]))
+        eligible.sort(key=lambda x: x[0])
+        eligible_vinted_item_ids = [item_id for _, item_id in eligible]
 
     # Republication prioritaire (clic manuel "Republier maintenant" sur le
     # site) : consommée une seule fois, indépendamment de enabled/daily_limit
